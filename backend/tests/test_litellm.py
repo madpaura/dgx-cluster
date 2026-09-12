@@ -271,3 +271,57 @@ async def test_a_retry_does_not_flood_the_event_feed(client, proxy):
     warnings = [e for e in (await client.get("/api/events")).json()
                 if e["source"] == "litellm" and e["severity"] == "warning"]
     assert len(warnings) == 1, f"expected one warning, got {len(warnings)}"
+
+
+async def test_stale_entries_are_pruned_so_routing_never_hits_a_dead_backend(client, proxy):
+    """A control-plane restart leaves the proxy holding entries for containers
+    that are gone. Left alone, LiteLLM load-balances a share of user requests
+    onto nothing."""
+    from app.db import SessionLocal
+    from app import worker
+
+    await register_fleet(["dgx-01", "dgx-02"])
+    deps = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 2})).json()
+    await pump()
+    assert len(proxy["models"]) == 2
+
+    # one replica dies
+    await client.post(f"/api/deployments/{deps[0]['id']}/stop")
+    proxy["models"][deps[0]["id"]] = {            # as if the removal never landed
+        "model_name": "llama3.1-8b",
+        "litellm_params": {"api_base": "http://dgx-01.sim.local:8100/v1"},
+        "model_info": {"id": deps[0]["id"], "dgxctl_deployment_id": deps[0]["id"]},
+    }
+
+    async with SessionLocal() as s:
+        await worker.litellm_pass(s)
+
+    assert deps[0]["id"] not in proxy["models"], "the dead backend must be dropped"
+    assert deps[1]["id"] in proxy["models"], "the live one must stay"
+
+
+async def test_the_periodic_pass_leaves_externally_managed_models_alone(client, proxy):
+    from app.db import SessionLocal
+    from app import worker
+
+    proxy["models"]["external"] = {
+        "model_name": "gpt-4o", "litellm_params": {"api_base": "https://api.openai.com/v1"},
+        "model_info": {"id": "external"},
+    }
+    async with SessionLocal() as s:
+        await worker.litellm_pass(s)
+    assert "external" in proxy["models"]
+
+
+async def test_the_periodic_pass_is_silent_when_nothing_changes(client, proxy):
+    from app.db import SessionLocal
+    from app import worker
+
+    await register_fleet(["dgx-01"])
+    await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})
+    await pump()
+    before = len((await client.get("/api/events")).json())
+
+    async with SessionLocal() as s:
+        await worker.litellm_pass(s)
+    assert len((await client.get("/api/events")).json()) == before

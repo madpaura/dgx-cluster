@@ -137,6 +137,70 @@ class LiteLLMClient:
         return {"ok": True, "reply": choice, "usage": data.get("usage", {})}
 
 
+async def reconcile(db) -> dict:
+    """Make the proxy match the fleet, in both directions.
+
+    Registers healthy deployments the proxy is missing, and removes entries
+    whose deployment is no longer healthy — the second half matters because a
+    stale entry means LiteLLM load-balances onto a backend that is gone, so a
+    share of user requests fail. Entries dgxctl did not create (hosted APIs
+    added by hand) are never touched.
+
+    Returns what changed. Never raises: an unreachable proxy is reported, not
+    escalated.
+    """
+    from sqlalchemy import select
+
+    from ..models import ACTIVE_STATUSES, Deployment
+
+    if not settings.litellm_auto_register:
+        return {"added": [], "removed": [], "errors": ["auto-register disabled"]}
+
+    client = LiteLLMClient()
+    added: list[str] = []
+    removed: list[str] = []
+    errors: list[str] = []
+    try:
+        try:
+            groups = await client.groups()
+        except LiteLLMError as exc:
+            return {"added": [], "removed": [], "errors": [str(exc)]}
+
+        registered = {m["deployment_id"] for g in groups for m in g["members"] if m.get("deployment_id")}
+
+        rows = await db.execute(select(Deployment).where(Deployment.status == "healthy"))
+        healthy = list(rows.scalars().unique())
+        healthy_ids = {d.id for d in healthy}
+
+        for dep in healthy:
+            if dep.id in registered:
+                dep.litellm_registered = True
+                continue
+            ok, msg = await sync_deployment(dep, register=True)
+            dep.litellm_registered = ok
+            if ok:
+                dep.litellm_model_id = dep.id
+                added.append(f"{dep.served_model_name}@{dep.node.name}")
+            else:
+                errors.append(msg)
+
+        for stale in registered - healthy_ids:
+            try:
+                await client.deregister(stale)
+                removed.append(stale)
+            except LiteLLMError as exc:
+                errors.append(str(exc))
+
+        rows = await db.execute(select(Deployment).where(Deployment.status.in_(ACTIVE_STATUSES)))
+        for dep in rows.scalars().unique():
+            if dep.status.value != "healthy":
+                dep.litellm_registered = False
+
+        return {"added": added, "removed": removed, "errors": errors}
+    finally:
+        await client.close()
+
+
 async def sync_deployment(deployment, register: bool) -> tuple[bool, str]:
     """Register or deregister one deployment. Returns (ok, message).
 

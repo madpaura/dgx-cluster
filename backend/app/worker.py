@@ -208,6 +208,27 @@ async def metrics_pass(db: AsyncSession) -> None:
     await db.commit()
 
 
+# -------------------------------------------------------------------- litellm
+
+async def litellm_pass(db: AsyncSession) -> None:
+    """Keep the proxy consistent with the fleet without anyone asking.
+
+    Registration is retried inline by the reconciler, but only this pass
+    *removes* entries for deployments that are gone — and a stale entry means
+    LiteLLM routes a share of user requests to a backend that no longer exists.
+    """
+    result = await litellm_svc.reconcile(db)
+    if result["added"] or result["removed"]:
+        await audit.emit(
+            db, severity="info", source="litellm", source_id="",
+            message=(f"proxy reconciled: registered {len(result['added'])}, "
+                     f"removed {len(result['removed'])} stale entr"
+                     f"{'y' if len(result['removed']) == 1 else 'ies'}"),
+            detail=result,
+        )
+    await db.commit()
+
+
 # ------------------------------------------------------------------ retention
 
 async def retention_pass(db: AsyncSession) -> None:
@@ -220,4 +241,5 @@ def start(loop_tasks: list[asyncio.Task]) -> None:
     loop_tasks.append(asyncio.create_task(_loop("inventory", settings.gpu_poll_seconds, inventory_pass)))
     loop_tasks.append(asyncio.create_task(_loop("reconcile", settings.health_poll_seconds, reconcile_pass)))
     loop_tasks.append(asyncio.create_task(_loop("metrics", settings.vllm_poll_seconds, metrics_pass)))
+    loop_tasks.append(asyncio.create_task(_loop("litellm", 60, litellm_pass)))
     loop_tasks.append(asyncio.create_task(_loop("retention", 3600, retention_pass)))
