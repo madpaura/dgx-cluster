@@ -14,6 +14,7 @@ from sqlalchemy import select
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import worker
+from .mcp_server import build_mcp_app, mcp
 from .api import auth_api, catalog, clusters, deployments, fleet, litellm_api, nodes
 from .config import settings
 from .db import SessionLocal, init_db
@@ -82,15 +83,23 @@ async def lifespan(app: FastAPI):
     await init_db()
     await bootstrap()
     worker.start(_tasks)
-    log.info("dgxctl up: driver=%s auth=%s", settings.driver, settings.auth_mode)
-    try:
-        yield
-    finally:
-        for t in _tasks:
-            t.cancel()
-        await asyncio.gather(*_tasks, return_exceptions=True)
-        await close_driver()
+    log.info("dgxctl up: driver=%s auth=%s mcp=%s",
+             settings.driver, settings.auth_mode, "on" if _mcp_app else "off")
+    # The mounted MCP app has its own lifespan that FastAPI will not run, so
+    # its session manager is started here.
+    async with contextlib.AsyncExitStack() as stack:
+        if _mcp_app is not None:
+            await stack.enter_async_context(mcp.session_manager.run())
+        try:
+            yield
+        finally:
+            for t in _tasks:
+                t.cancel()
+            await asyncio.gather(*_tasks, return_exceptions=True)
+            await close_driver()
 
+
+_mcp_app = build_mcp_app()
 
 app = FastAPI(title="dgxctl", version="0.1.0", lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=settings.secret_key, same_site="lax")
@@ -107,6 +116,11 @@ for r in (
     deployments.router, catalog.router, litellm_api.router,
 ):
     app.include_router(r)
+
+
+if _mcp_app is not None:
+    # Mounted before the SPA catch-all, which would otherwise swallow /mcp.
+    app.mount("/mcp", _mcp_app)
 
 
 @app.get("/healthz", include_in_schema=False)

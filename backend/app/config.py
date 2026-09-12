@@ -42,11 +42,26 @@ class Settings(BaseSettings):
     oidc_deployer_groups: str = "gpu-deployers"
     public_url: str = "http://localhost:8000"
 
+    # --- mcp ---
+    # Agent-facing control endpoint at /mcp. It can stop every model in the
+    # fleet, so it refuses to mount unauthenticated outside dev mode.
+    mcp_enabled: bool = True
+    mcp_token: str = ""
+    # The MCP transport validates the Host header as DNS-rebinding protection,
+    # which rejects every request once you reach the server by its real
+    # hostname. Listed hosts are allowed; "*" turns the check off and leans on
+    # the bearer token, which is the control that actually matters here.
+    mcp_allowed_hosts: str = "*"
+
     # --- polling ---
     gpu_poll_seconds: int = 10
     vllm_poll_seconds: int = 15
     health_poll_seconds: int = 20
     metric_retention_hours: int = 48
+
+    @property
+    def mcp_host_list(self) -> list[str]:
+        return [h.strip() for h in self.mcp_allowed_hosts.split(",") if h.strip()]
 
     @property
     def cors_list(self) -> list[str]:

@@ -43,6 +43,44 @@ the problem and what to change.
 twice and the two replicas become one load-balanced model group; nothing else
 to configure.
 
+## Letting an agent run it
+
+The dashboard exposes its own capabilities as an MCP server at `/mcp`
+(streamable HTTP, stateless), so an agent can operate the fleet with the same
+21 tools the UI is built on — and the same validation, since every tool calls
+the very endpoint function the browser calls.
+
+```jsonc
+// Claude Code / Claude Desktop
+{
+  "mcpServers": {
+    "dgxctl": {
+      "type": "http",
+      "url": "http://dgxctl.your-office.lan:8080/mcp/",
+      "headers": { "Authorization": "Bearer $DGXCTL_MCP_TOKEN" }
+    }
+  }
+}
+```
+
+What makes it useful to an agent rather than just callable:
+
+- **`plan_deployment` is a dry run** that reports which nodes can host a model
+  and *why each other one cannot*. `deploy_model` refuses with the same
+  reasoning rather than half-placing — `"dgx-01: needs 149 GiB per GPU, largest
+  free GPU has 79 GiB"` is something an agent can act on.
+- **`deployment_logs` returns a diagnosis, not a log.** Each finding names the
+  cause, quotes the evidence, and states the fix, so the agent never has to
+  parse a vLLM traceback.
+- **`fleet_summary` leads with `needs_attention`** — a list of what is wrong, or
+  empty.
+- **Agent actions are attributable.** They run as `agent@mcp`, so the audit log
+  distinguishes what an agent did from what a person did.
+
+Set `DGXCTL_MCP_TOKEN` before exposing it: anyone who can reach `/mcp` can stop
+every model in the fleet. Without a token the endpoint refuses to mount unless
+`auth_mode=dev`. Set `DGXCTL_MCP_ENABLED=false` to remove it entirely.
+
 ## Themes
 
 Three colour schemes ship, switched from the swatches in the top bar. The choice
@@ -81,7 +119,7 @@ card and get told why, stop, restart, bulk actions. Nothing touches hardware.
 ## Verifying it
 
 ```bash
-make test        # 205 tests, ~20s, no hardware and no network
+make test        # 238 tests, ~30s, no hardware and no network
 ```
 
 The suite runs the whole application in process against the simulated fleet and
@@ -89,7 +127,8 @@ a throwaway database, driving the reconcile loops by hand so each test observes
 a deterministic point in the cycle. It covers placement and its rejection
 reasons, every diagnostic rule, the vLLM metric parser, every HTTP endpoint,
 the reconcile state machine, LiteLLM (against a stand-in proxy that reproduces
-its real failure modes), roles, team quotas and the live-update bus.
+its real failure modes), roles, team quotas, the live-update bus, and the MCP
+endpoint over its real JSON-RPC wire protocol.
 
 The SSH driver is covered too, even though it never runs under the simulator:
 its command construction and its `nvidia-smi` / `docker ps` parsing are tested
@@ -140,7 +179,7 @@ client.chat.completions.create(model="qwen3-32b", messages=[...])
 
 | Port | What |
 |---|---|
-| 8080 | dgxctl UI + API |
+| 8080 | dgxctl UI + API, and the MCP endpoint at `/mcp` |
 | 4000 | LiteLLM — this is the only one your users need |
 | 8100–8399 | vLLM containers on the nodes (control server reaches these directly) |
 
@@ -162,6 +201,7 @@ backend/app/
     diagnostics.py  log signature -> cause -> fix
     litellm.py      register, deregister, resync, test
     vllm_metrics.py Prometheus text -> the numbers operators read
+  mcp_server.py   the same capabilities as MCP tools for an agent
   worker.py       inventory, reconcile and metrics loops
 frontend/src/
   pages/          Fleet, Models, Proxy, Catalog, Activity

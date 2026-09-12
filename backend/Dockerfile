@@ -19,7 +19,7 @@ COPY backend/pyproject.toml ./
 RUN pip install --no-cache-dir \
       "fastapi>=0.115" "uvicorn[standard]>=0.32" "sqlalchemy[asyncio]>=2.0.36" \
       "asyncpg>=0.30" "pydantic>=2.9" "pydantic-settings>=2.6" "asyncssh>=2.18" \
-      "httpx>=0.27" "authlib>=1.3" "itsdangerous>=2.2" "greenlet>=3.1"
+      "httpx>=0.27" "authlib>=1.3" "itsdangerous>=2.2" "greenlet>=3.1" "mcp>=2.2"
 
 COPY backend/app ./app
 COPY --from=ui /backend/static ./static

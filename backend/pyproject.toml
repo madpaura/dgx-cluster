@@ -15,6 +15,7 @@ dependencies = [
   "itsdangerous>=2.2",
   "python-jose[cryptography]>=3.3",
   "greenlet>=3.1",
+  "mcp>=2.2",
 ]
 
 [tool.setuptools.packages.find]
