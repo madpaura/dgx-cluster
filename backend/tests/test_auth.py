@@ -172,3 +172,47 @@ async def test_teams_are_listed(client):
     await make_team("alpha")
     await make_team("beta")
     assert {t["name"] for t in (await client.get("/api/auth/teams")).json()} == {"alpha", "beta"}
+
+
+# --------------------------------------------------- provisioning from an IdP
+
+async def test_a_new_user_is_provisioned_on_first_sign_in(client):
+    """The OAuth dance itself is authlib's; what is ours is deciding who this
+    person is and what they may do."""
+    from app.auth import upsert_user
+
+    async with SessionLocal() as s:
+        user = await upsert_user(s, email="ada@corp", name="Ada Lovelace",
+                                 role=role_for_groups(["gpu-admins"]))
+    assert user.email == "ada@corp"
+    assert user.role is Role.admin
+
+
+async def test_signing_in_again_refreshes_the_role(client):
+    """Someone removed from the admins group must lose admin at next sign-in."""
+    from app.auth import upsert_user
+
+    async with SessionLocal() as s:
+        await upsert_user(s, email="ada@corp", name="Ada", role=Role.admin)
+    async with SessionLocal() as s:
+        user = await upsert_user(s, email="ada@corp", name="Ada",
+                                 role=role_for_groups(["nothing-special"]))
+    assert user.role is Role.viewer
+
+    async with SessionLocal() as s:
+        rows = await s.execute(select(User).where(User.email == "ada@corp"))
+        assert len(rows.scalars().all()) == 1, "must update, not duplicate"
+
+
+async def test_a_team_claim_creates_the_team_once(client):
+    from app.auth import upsert_user
+
+    async with SessionLocal() as s:
+        a = await upsert_user(s, email="a@corp", name="A", role=Role.deployer, team_name="vision")
+    async with SessionLocal() as s:
+        b = await upsert_user(s, email="b@corp", name="B", role=Role.deployer, team_name="vision")
+    assert a.team_id == b.team_id
+
+    async with SessionLocal() as s:
+        rows = await s.execute(select(Team).where(Team.name == "vision"))
+        assert len(rows.scalars().all()) == 1

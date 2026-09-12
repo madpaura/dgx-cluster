@@ -78,6 +78,25 @@ make dev-api          # http://localhost:8000
 Everything works: deploy, watch weights load, see a 70B model OOM on a 48 GB
 card and get told why, stop, restart, bulk actions. Nothing touches hardware.
 
+## Verifying it
+
+```bash
+make test        # 205 tests, ~20s, no hardware and no network
+```
+
+The suite runs the whole application in process against the simulated fleet and
+a throwaway database, driving the reconcile loops by hand so each test observes
+a deterministic point in the cycle. It covers placement and its rejection
+reasons, every diagnostic rule, the vLLM metric parser, every HTTP endpoint,
+the reconcile state machine, LiteLLM (against a stand-in proxy that reproduces
+its real failure modes), roles, team quotas and the live-update bus.
+
+The SSH driver is covered too, even though it never runs under the simulator:
+its command construction and its `nvidia-smi` / `docker ps` parsing are tested
+directly, because that is the code most likely to be wrong on the day the fleet
+is real. What cannot be verified without hardware is the SSH transport itself
+and whether vLLM actually loads a given model on your GPUs.
+
 ## Deploy it at the office
 
 **1. Prepare each GPU node** (once per DGX / workstation):
