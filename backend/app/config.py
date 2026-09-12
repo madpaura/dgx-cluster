@@ -53,6 +53,23 @@ class Settings(BaseSettings):
     # the bearer token, which is the control that actually matters here.
     mcp_allowed_hosts: str = "*"
 
+    # --- security ---
+    # Verify GPU node host keys against this file. Empty disables the check,
+    # which is a MITM risk on a shared network.
+    ssh_known_hosts: str = ""
+    # Set when the dashboard is served over HTTPS, so session cookies are not
+    # sent in the clear.
+    session_https_only: bool = False
+    # What an MCP agent may do: admin, deployer or viewer.
+    mcp_role: str = "admin"
+
+    # --- retention ---
+    event_retention_days: int = 30
+    audit_retention_days: int = 365
+    # The fleet summary asks LiteLLM whether it is alive; the dashboard polls
+    # the summary every few seconds per open tab, so the answer is cached.
+    summary_cache_seconds: int = 15
+
     # --- polling ---
     gpu_poll_seconds: int = 10
     vllm_poll_seconds: int = 15

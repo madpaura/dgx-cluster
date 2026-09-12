@@ -102,7 +102,12 @@ async def lifespan(app: FastAPI):
 _mcp_app = build_mcp_app()
 
 app = FastAPI(title="dgxctl", version="0.1.0", lifespan=lifespan)
-app.add_middleware(SessionMiddleware, secret_key=settings.secret_key, same_site="lax")
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.secret_key,
+    same_site="lax",
+    https_only=settings.session_https_only,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_list,
