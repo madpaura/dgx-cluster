@@ -11,6 +11,7 @@ import logging
 from authlib.integrations.starlette_client import OAuth
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
@@ -45,14 +46,26 @@ def role_for_groups(groups: list[str]) -> Role:
 
 
 async def upsert_user(db: AsyncSession, *, email: str, name: str, role: Role, team_name: str = "") -> User:
+    """Provision or refresh a user, safely against a concurrent first sign-in.
+
+    Get-or-create is a race: several requests arriving together on a database
+    that has never seen this person all find nothing and all insert. The unique
+    index on email is what settles it — one wins, the losers look again. A
+    browser opening the dashboard fires half a dozen parallel polls, so this is
+    the ordinary case on a fresh deployment, not a corner case.
+    """
     row = await db.execute(select(User).where(User.email == email))
     user = row.scalar_one_or_none()
     if user is None:
-        user = User(email=email, name=name, role=role)
-        db.add(user)
-    else:
-        user.name = name or user.name
-        user.role = role
+        db.add(User(email=email, name=name, role=role))
+        try:
+            await db.flush()
+        except IntegrityError:
+            await db.rollback()
+        row = await db.execute(select(User).where(User.email == email))
+        user = row.scalar_one()
+    user.name = name or user.name
+    user.role = role
     if team_name:
         trow = await db.execute(select(Team).where(Team.name == team_name))
         team = trow.scalar_one_or_none()

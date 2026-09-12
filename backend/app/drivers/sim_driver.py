@@ -181,6 +181,8 @@ class SimDriver(NodeDriver):
 
     async def stop(self, node, name: str, remove: bool = True) -> None:
         sim = self._node(node)
+        if sim.unreachable:
+            raise RuntimeError("Cannot connect to the Docker daemon (simulated: node down)")
         c = sim.containers.get(name)
         if c:
             c.state = "exited"

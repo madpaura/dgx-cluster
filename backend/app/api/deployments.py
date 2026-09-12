@@ -8,7 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth import current_user, require_deployer
 from ..db import get_db
-from ..models import ACTIVE_STATUSES, Deployment, DeployStatus, MetricSample, ModelSpec, Node, Role, User
+from ..models import (
+    ACTIVE_STATUSES, Deployment, DeployStatus, MetricSample, ModelSpec, Node, Role, Team, User,
+)
 from ..schemas import (
     BulkAction, DeploymentOut, DeployRequest, FindingOut, LogsOut, PlacementOut, PlanOut,
     RejectionOut, SeriesOut, SeriesPoint,
@@ -18,6 +20,13 @@ from ..services import diagnostics
 from ..services.placement import plan as plan_placements
 
 router = APIRouter(prefix="/api/deployments", tags=["deployments"])
+
+# How many times an automatically placed deploy will look again after losing a
+# race for the GPUs it chose. Every caller in a burst tends to pick the same
+# best node, so each one needs roughly as many looks as there are rivals ahead
+# of it. The bound exists to stop a livelock on a genuinely full fleet, not to
+# ration attempts; exhausting it returns a 409 that is safe to retry.
+PLACEMENT_RETRIES = 10
 
 
 def to_out(dep: Deployment) -> DeploymentOut:
@@ -126,28 +135,41 @@ async def create_deployment(
     if explicit:
         await _check_free(db, explicit)
 
-    try:
-        targets = await deploy_svc.resolve_targets(
-            db, replicas=body.replicas, tensor_parallel_size=tp, per_gpu_gb=per_gpu_gb,
-            explicit=explicit, node_filter=body.node_ids or None,
-        )
-    except deploy_svc.DeployError as exc:
-        raise HTTPException(409, str(exc)) from exc
+    # Placement reads the fleet without holding the allocation lock, so another
+    # caller can claim the chosen GPUs in between. The claim itself is checked
+    # under the lock and refuses, which is what prevents double-booking; here we
+    # simply look again. Someone who named exact GPUs gets the refusal instead —
+    # re-placing would put their model somewhere they did not ask for.
+    # Read off the ORM object once. Rolling back a lost race expires every
+    # instance in the session, and touching an expired attribute afterwards is
+    # a refresh — IO the async session cannot perform mid-request.
+    actor, actor_role, actor_team = user.email, user.role, user.team_id
 
-    await _check_quota(db, user, targets, tp)
+    attempts = 1 if explicit else PLACEMENT_RETRIES
+    for attempt in range(attempts):
+        try:
+            targets = await deploy_svc.resolve_targets(
+                db, replicas=body.replicas, tensor_parallel_size=tp, per_gpu_gb=per_gpu_gb,
+                explicit=explicit, node_filter=body.node_ids or None,
+            )
+            await _check_quota(db, actor_role, actor_team, targets)
+            deps = await deploy_svc.create(
+                db, actor=actor, served_model_name=name, hf_repo=hf_repo, targets=targets,
+                tensor_parallel_size=tp, spec=spec, max_model_len=max_len,
+                quantization=body.quantization or "", gpu_memory_utilization=body.gpu_memory_utilization,
+                extra_args=body.extra_args, image=body.image,
+                team_id=body.team_id or actor_team,
+            )
+            break
+        except deploy_svc.DeployError as exc:
+            lost_the_race = "already in use" in str(exc) and attempt < attempts - 1
+            if lost_the_race:
+                await db.rollback()
+                continue
+            # Drained node, no capacity, unknown target: all the caller's
+            # problem to fix, none of them a server fault.
+            raise HTTPException(409, str(exc)) from exc
 
-    try:
-        deps = await deploy_svc.create(
-            db, actor=user.email, served_model_name=name, hf_repo=hf_repo, targets=targets,
-            tensor_parallel_size=tp, spec=spec, max_model_len=max_len,
-            quantization=body.quantization or "", gpu_memory_utilization=body.gpu_memory_utilization,
-            extra_args=body.extra_args, image=body.image,
-            team_id=body.team_id or user.team_id,
-        )
-    except deploy_svc.DeployError as exc:
-        # Drained node, no free port, unknown target: all the caller's problem
-        # to fix, none of them a server fault.
-        raise HTTPException(409, str(exc)) from exc
     return [to_out(d) for d in deps]
 
 
@@ -167,18 +189,27 @@ async def _check_free(db: AsyncSession, targets: list[deploy_svc.Target]) -> Non
             raise HTTPException(400, f"{node.name} has no GPU {unknown}")
 
 
-async def _check_quota(db: AsyncSession, user: User, targets, tp: int) -> None:
-    if user.role == Role.admin or not user.team_id or not user.team or not user.team.max_gpus:
+async def _check_quota(db: AsyncSession, role: Role, team_id: str | None, targets) -> None:
+    """Takes the caller's role and team rather than the User row: this runs
+    inside a retry loop whose rollback expires every ORM instance."""
+    if role == Role.admin or not team_id:
         return
+    # Fetched rather than reached through user.team: a User that was just
+    # inserted has never been through a relationship loader, and touching one
+    # then is a lazy load, which async cannot perform.
+    team = await db.get(Team, team_id)
+    if team is None or not team.max_gpus:
+        return
+
     rows = await db.execute(
-        select(Deployment).where(Deployment.team_id == user.team_id, Deployment.status.in_(ACTIVE_STATUSES))
+        select(Deployment).where(Deployment.team_id == team_id, Deployment.status.in_(ACTIVE_STATUSES))
     )
     in_use = sum(len(d.gpu_indices) for d in rows.scalars().unique())
     asking = sum(len(t.gpu_indices) for t in targets)
-    if in_use + asking > user.team.max_gpus:
+    if in_use + asking > team.max_gpus:
         raise HTTPException(
             409,
-            f"team '{user.team.name}' quota is {user.team.max_gpus} GPUs; "
+            f"team '{team.name}' quota is {team.max_gpus} GPUs; "
             f"{in_use} in use, this request needs {asking}",
         )
 

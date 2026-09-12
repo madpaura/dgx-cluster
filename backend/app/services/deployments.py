@@ -7,7 +7,9 @@ honest when a node reboots behind your back.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import weakref
 import re
 import uuid
 from datetime import datetime, timezone
@@ -21,12 +23,35 @@ from ..config import settings
 from ..drivers import LaunchSpec, get_driver
 from ..models import ACTIVE_STATUSES, Deployment, DeployStatus, ModelSpec, Node, NodeStatus
 from . import litellm as litellm_svc
-from .placement import Placement, plan
+from .placement import Placement, busy_gpu_indices, plan
 
 log = logging.getLogger(__name__)
 
 LABEL_KEY = "dgxctl.deployment"
 STARTUP_GRACE_SECONDS = 900  # big models legitimately take many minutes to load
+
+# Choosing GPUs and a port is read-then-act: two callers that look at the same
+# moment both see the same GPU free and both claim it. That is not hypothetical
+# here — the MCP endpoint exists so an agent can deploy while a human is at the
+# dashboard. gpu_indices is a JSON list, so no unique constraint can catch the
+# collision either; serialising the claim is what prevents it.
+#
+# This holds for one control-plane process, which is what dgxctl is: the event
+# bus and the worker loops already assume a single instance. Running the API
+# replicated would need a database-level lock instead.
+#
+# Keyed by event loop rather than created once at import: an asyncio.Lock binds
+# to the loop that first awaits it and raises on any other, which a module-level
+# singleton makes impossible to reuse across loops.
+_allocation_locks: "weakref.WeakKeyDictionary[object, asyncio.Lock]" = weakref.WeakKeyDictionary()
+
+
+def allocation_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _allocation_locks.get(loop)
+    if lock is None:
+        lock = _allocation_locks[loop] = asyncio.Lock()
+    return lock
 
 
 @dataclass
@@ -144,101 +169,156 @@ async def create(
     image: str = "",
     team_id: str | None = None,
 ) -> list[Deployment]:
-    """Create and launch one deployment per target. Failures are per-target:
-    deploying to six nodes where one is down still gives you five."""
-    driver = get_driver()
+    """Claim capacity, then launch. Failures are per-target: deploying to six
+    nodes where one is down still gives you five."""
+    created = await _reserve(
+        db, actor=actor, served_model_name=served_model_name, hf_repo=hf_repo,
+        targets=targets, tensor_parallel_size=tensor_parallel_size, spec=spec,
+        max_model_len=max_model_len, quantization=quantization,
+        gpu_memory_utilization=gpu_memory_utilization, extra_args=extra_args,
+        image=image, team_id=team_id,
+    )
+    await _launch(db, created, actor=actor)
+    return created
+
+
+async def _reserve(
+    db: AsyncSession,
+    *,
+    actor: str,
+    served_model_name: str,
+    hf_repo: str,
+    targets: list[Target],
+    tensor_parallel_size: int,
+    spec: ModelSpec | None,
+    max_model_len: int,
+    quantization: str,
+    gpu_memory_utilization: float,
+    extra_args: dict | None,
+    image: str,
+    team_id: str | None,
+) -> list[Deployment]:
+    """Write the claim down and commit it, before anything slow happens.
+
+    The commit is the point: until these rows are visible with an active
+    status, another caller still sees these GPUs and ports as free. Launching
+    inside the lock instead would serialise every `docker run` in the fleet
+    behind one mutex, so the reservation is what is protected, not the work.
+    """
     image = image or (spec.vllm_image if spec and spec.vllm_image else settings.vllm_image)
     created: list[Deployment] = []
 
-    for target in targets:
-        node = await db.get(Node, target.node_id)
-        if node is None:
-            raise DeployError(f"unknown node {target.node_id}")
-        if node.status in (NodeStatus.draining, NodeStatus.maintenance):
-            raise DeployError(f"{node.name} is {node.status.value}; not accepting deployments")
+    async with allocation_lock():
+        for target in targets:
+            node = await db.get(Node, target.node_id)
+            if node is None:
+                raise DeployError(f"unknown node {target.node_id}")
+            if node.status in (NodeStatus.draining, NodeStatus.maintenance):
+                raise DeployError(f"{node.name} is {node.status.value}; not accepting deployments")
 
-        port = await allocate_port(db, node.id)
-        # Assign the id up front: the container name embeds it, and a Python-side
-        # column default is not materialised until flush.
-        dep = Deployment(
-            id=str(uuid.uuid4()),
-            served_model_name=served_model_name,
-            spec_id=spec.id if spec else None,
-            hf_repo=hf_repo,
-            node_id=node.id,
-            node=node,  # populate the relationship so callers can serialise without a lazy load
-            gpu_indices=list(target.gpu_indices),
-            port=port,
-            status=DeployStatus.pending,
-            image=image,
-            tensor_parallel_size=tensor_parallel_size,
-            team_id=team_id,
-            created_by=actor,
-        )
-        dep.container_name = f"{settings.container_prefix}-{slugify(served_model_name)}-{dep.id[:8]}"
-        args = build_vllm_args(
-            hf_repo=hf_repo,
-            served_model_name=served_model_name,
-            tensor_parallel_size=tensor_parallel_size,
-            max_model_len=max_model_len,
-            quantization=quantization or (spec.quantization if spec else ""),
-            gpu_memory_utilization=gpu_memory_utilization,
-            revision=spec.revision if spec else "",
-            extra_args={**(spec.extra_args if spec else {}), **(extra_args or {})},
-        )
-        dep.vllm_args = {"argv": args}
-        db.add(dep)
-        await db.flush()
+            clash = sorted(set(target.gpu_indices) & busy_gpu_indices(node))
+            if clash:
+                raise DeployError(
+                    f"{node.name} GPU {clash} already in use; refresh and pick again"
+                )
 
-        env = {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}
-        if settings.hf_token:
-            env["HUGGING_FACE_HUB_TOKEN"] = settings.hf_token
+            port = await allocate_port(db, node.id)
+            dep = Deployment(
+                id=str(uuid.uuid4()),
+                served_model_name=served_model_name,
+                spec_id=spec.id if spec else None,
+                hf_repo=hf_repo,
+                node_id=node.id,
+                node=node,
+                gpu_indices=list(target.gpu_indices),
+                port=port,
+                status=DeployStatus.pending,
+                status_reason="claimed; starting container",
+                image=image,
+                tensor_parallel_size=tensor_parallel_size,
+                team_id=team_id,
+                created_by=actor,
+            )
+            dep.container_name = f"{settings.container_prefix}-{slugify(served_model_name)}-{dep.id[:8]}"
+            dep.vllm_args = {"argv": build_vllm_args(
+                hf_repo=hf_repo,
+                served_model_name=served_model_name,
+                tensor_parallel_size=tensor_parallel_size,
+                max_model_len=max_model_len,
+                quantization=quantization or (spec.quantization if spec else ""),
+                gpu_memory_utilization=gpu_memory_utilization,
+                revision=spec.revision if spec else "",
+                extra_args={**(spec.extra_args if spec else {}), **(extra_args or {})},
+            )}
+            db.add(dep)
+            node.deployments.append(dep)
+            created.append(dep)
 
+        await db.commit()
+    return created
+
+
+async def _launch(db: AsyncSession, deployments: list[Deployment], *, actor: str) -> None:
+    """Start the containers for claims already written down.
+
+    A claim whose container will not start is marked failed, which releases its
+    GPUs — the reservation only outlives the attempt if the attempt succeeds.
+    """
+    driver = get_driver()
+    env = {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}
+    if settings.hf_token:
+        env["HUGGING_FACE_HUB_TOKEN"] = settings.hf_token
+
+    for dep in deployments:
+        args = list(dep.vllm_args.get("argv", []))
         launch = LaunchSpec(
             name=dep.container_name,
-            image=image,
-            gpu_indices=list(target.gpu_indices),
-            host_port=port,
+            image=dep.image,
+            gpu_indices=[int(i) for i in dep.gpu_indices],
+            host_port=dep.port,
             args=args,
             env=env,
             volumes={settings.hf_cache_dir: "/root/.cache/huggingface"},
             labels={
                 LABEL_KEY: dep.id,
-                "dgxctl.model": served_model_name,
+                "dgxctl.model": dep.served_model_name,
                 "dgxctl.owner": actor,
             },
         )
         try:
             dep.status = DeployStatus.pulling
-            dep.container_id = await driver.launch(node, launch)
+            dep.container_id = await driver.launch(dep.node, launch)
             dep.status = DeployStatus.starting
             dep.status_reason = "container started, loading weights"
             await audit.record(
-                db, actor=actor, action="deployment.create", target_type="deployment", target_id=dep.id,
-                summary=f"deploy {served_model_name} to {node.name} GPUs {target.gpu_indices}",
-                detail={"argv": args, "image": image, "port": port},
+                db, actor=actor, action="deployment.create", target_type="deployment",
+                target_id=dep.id,
+                summary=f"deploy {dep.served_model_name} to {dep.node.name} GPUs {dep.gpu_indices}",
+                detail={"argv": args, "image": dep.image, "port": dep.port},
             )
             await audit.emit(
                 db, severity="info", source="deployment", source_id=dep.id,
-                message=f"{served_model_name} starting on {node.name} GPU {','.join(map(str, target.gpu_indices))}",
+                message=(f"{dep.served_model_name} starting on {dep.node.name} "
+                         f"GPU {','.join(str(i) for i in dep.gpu_indices)}"),
             )
         except Exception as exc:
             dep.status = DeployStatus.failed
             dep.status_reason = str(exc)[:1000]
             await audit.record(
-                db, actor=actor, action="deployment.create", target_type="deployment", target_id=dep.id,
-                summary=f"failed to start {served_model_name} on {node.name}", detail={"error": str(exc)}, ok=False,
+                db, actor=actor, action="deployment.create", target_type="deployment",
+                target_id=dep.id,
+                summary=f"failed to start {dep.served_model_name} on {dep.node.name}",
+                detail={"error": str(exc)}, ok=False,
             )
             await audit.emit(
                 db, severity="error", source="deployment", source_id=dep.id,
-                message=f"failed to start {served_model_name} on {node.name}: {str(exc)[:200]}",
+                message=(f"failed to start {dep.served_model_name} on {dep.node.name}: "
+                         f"{str(exc)[:200]}"),
             )
-        created.append(dep)
 
     await db.commit()
-    for dep in created:
+    for dep in deployments:
         events.publish("deployment", {"id": dep.id, "status": dep.status.value})
-    return created
 
 
 async def stop(db: AsyncSession, dep: Deployment, *, actor: str, remove: bool = True) -> None:
@@ -261,17 +341,31 @@ async def stop(db: AsyncSession, dep: Deployment, *, actor: str, remove: bool = 
         dep.status = DeployStatus.stopped
         dep.status_reason = f"stopped by {actor}"
     except Exception as exc:
-        dep.status = DeployStatus.failed
-        dep.status_reason = f"stop failed: {exc}"[:1000]
+        # Not `failed`: that status releases the GPUs, and the container may
+        # well still be running and still holding them. Leaving the claim
+        # standing keeps the next deploy off hardware that is still busy;
+        # the reconciler clears it once the node says the container is gone.
+        dep.status = DeployStatus.degraded
+        dep.status_reason = (
+            f"stop failed, container may still be running: {exc}"
+        )[:1000]
 
     await audit.record(
         db, actor=actor, action="deployment.stop", target_type="deployment", target_id=dep.id,
-        summary=f"stop {dep.served_model_name} on {dep.node.name}", ok=dep.status == DeployStatus.stopped,
+        summary=f"stop {dep.served_model_name} on {dep.node.name}",
+        ok=dep.status == DeployStatus.stopped,
     )
-    await audit.emit(
-        db, severity="info", source="deployment", source_id=dep.id,
-        message=f"{dep.served_model_name} stopped on {dep.node.name}",
-    )
+    if dep.status == DeployStatus.stopped:
+        await audit.emit(
+            db, severity="info", source="deployment", source_id=dep.id,
+            message=f"{dep.served_model_name} stopped on {dep.node.name}",
+        )
+    else:
+        await audit.emit(
+            db, severity="error", source="deployment", source_id=dep.id,
+            message=(f"could not stop {dep.served_model_name} on {dep.node.name}; "
+                     f"its GPUs stay reserved until the container is confirmed gone"),
+        )
     await db.commit()
     events.publish("deployment", {"id": dep.id, "status": dep.status.value})
 
@@ -285,9 +379,10 @@ async def restart(db: AsyncSession, dep: Deployment, *, actor: str) -> Deploymen
 
     await stop(db, dep, actor=actor, remove=True)
 
-    driver = get_driver()
     node = await db.get(Node, node_id)
-    port = await allocate_port(db, node_id)
+    async with allocation_lock():
+        port = await allocate_port(db, node_id)
+    driver = get_driver()
     new = Deployment(
         id=str(uuid.uuid4()),
         served_model_name=name, spec_id=spec_id, hf_repo=repo, node_id=node_id, node=node,

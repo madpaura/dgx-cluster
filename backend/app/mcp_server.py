@@ -30,7 +30,8 @@ from .api import litellm_api
 from .api import nodes as nodes_api
 from .config import settings
 from .db import SessionLocal
-from .models import Role, User
+from .auth import upsert_user
+from .models import Role
 from .schemas import ClusterCreate, DeployRequest, NodeCreate, NodeMove
 
 log = logging.getLogger(__name__)
@@ -63,13 +64,24 @@ mcp = MCPServer(
 async def _ctx():
     """A session plus the agent's own identity, so actions are attributable."""
     async with SessionLocal() as db:
-        rows = await db.execute(select(User).where(User.email == AGENT_EMAIL))
-        user = rows.scalar_one_or_none()
-        if user is None:
-            user = User(email=AGENT_EMAIL, name="MCP agent", role=Role.admin)
-            db.add(user)
-            await db.commit()
+        # Agents call tools in parallel, so provisioning the identity has to
+        # tolerate losing the insert race the same way a first sign-in does.
+        user = await upsert_user(
+            db, email=AGENT_EMAIL, name="MCP agent", role=_agent_role()
+        )
         yield db, user
+
+
+def _agent_role() -> Role:
+    """What an agent may do. Read per request rather than cached, so lowering it
+    and restarting actually demotes the identity instead of leaving an admin row
+    behind from before."""
+    try:
+        return Role(settings.mcp_role)
+    except ValueError:
+        log.warning("DGXCTL_MCP_ROLE=%r is not a role; falling back to viewer",
+                    settings.mcp_role)
+        return Role.viewer
 
 
 def _fail(exc: HTTPException) -> ToolError:
