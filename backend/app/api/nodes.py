@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import audit
 from ..auth import current_user, require_admin
 from ..db import get_db
-from ..models import ACTIVE_STATUSES, Node, NodeStatus, User
+from ..models import ACTIVE_STATUSES, Deployment, Node, NodeStatus, User
 from ..schemas import FindingOut, NodeCreate, NodeOut, NodeUpdate
 from ..services import diagnostics
 from ..services import nodes as node_svc
 
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
+
+
+async def _load(db: AsyncSession, node_id: str) -> Node | None:
+    """Fetch a node with its relationships eagerly loaded."""
+    rows = await db.execute(select(Node).where(Node.id == node_id))
+    return rows.scalars().unique().one_or_none()
 
 
 def to_out(node: Node) -> NodeOut:
@@ -58,7 +64,9 @@ async def create_node(body: NodeCreate, db: AsyncSession = Depends(get_db), user
     )
     await node_svc.refresh(db, node)   # immediate feedback: did SSH work?
     await db.commit()
-    return to_out(node)
+    # Re-read so the relationship loaders populate gpus/deployments/cluster for
+    # serialisation; the object we just built has never been through a loader.
+    return to_out(await _load(db, node.id))
 
 
 @router.patch("/{node_id}", response_model=NodeOut)
@@ -87,6 +95,9 @@ async def delete_node(node_id: str, db: AsyncSession = Depends(get_db), user: Us
     if active:
         raise HTTPException(409, f"{node.name} still has {len(active)} active deployment(s); stop them first")
     name = node.name
+    # Stopped and failed deployments still reference this node, and node_id is
+    # NOT NULL, so they go with it. The audit log keeps the history.
+    await db.execute(delete(Deployment).where(Deployment.node_id == node_id))
     await db.delete(node)
     await audit.record(
         db, actor=user.email, action="node.delete", target_type="node", target_id=node_id,

@@ -132,7 +132,11 @@ class Node(Base):
         back_populates="node", cascade="all, delete-orphan", lazy="selectin",
         order_by="Gpu.index",
     )
-    deployments: Mapped[list[Deployment]] = relationship(back_populates="node", lazy="selectin")
+    # passive_deletes stops the ORM nullifying deployments.node_id (which is
+    # NOT NULL) when a node goes; the rows are removed explicitly instead.
+    deployments: Mapped[list[Deployment]] = relationship(
+        back_populates="node", lazy="selectin", passive_deletes=True
+    )
 
     @property
     def schedulable(self) -> bool:

@@ -48,7 +48,11 @@ async def refresh(db: AsyncSession, node: Node, *, record_samples: bool = True) 
                 message=f"{node.name} is back online",
             )
 
-    existing = {g.index: g for g in node.gpus}
+    # Query the GPU rows rather than walking node.gpus: this function is called
+    # both with loaded nodes (the poller) and with brand-new ones (registration),
+    # and a relationship access on the latter is a lazy load that async cannot do.
+    rows = await db.execute(select(Gpu).where(Gpu.node_id == node.id))
+    existing = {g.index: g for g in rows.scalars()}
     now = datetime.now(timezone.utc)
     touched: list[tuple[Gpu, object]] = []
     for probe in facts.gpus:
@@ -56,7 +60,6 @@ async def refresh(db: AsyncSession, node: Node, *, record_samples: bool = True) 
         if gpu is None:
             gpu = Gpu(node_id=node.id, index=probe.index)
             db.add(gpu)
-            node.gpus.append(gpu)
         gpu.uuid = probe.uuid
         gpu.name = probe.name
         gpu.memory_total_mb = probe.memory_total_mb
@@ -94,10 +97,10 @@ async def refresh(db: AsyncSession, node: Node, *, record_samples: bool = True) 
             "id": node.id,
             "status": node.status.value,
             "gpus": [
-                {"index": g.index, "util": g.utilization,
-                 "mem_used_mb": g.memory_used_mb, "mem_total_mb": g.memory_total_mb,
-                 "temp_c": g.temperature_c, "power_w": g.power_draw_w}
-                for g in node.gpus
+                {"index": p.index, "util": p.utilization,
+                 "mem_used_mb": p.memory_used_mb, "mem_total_mb": p.memory_total_mb,
+                 "temp_c": p.temperature_c, "power_w": p.power_draw_w}
+                for p in facts.gpus
             ],
         },
     )

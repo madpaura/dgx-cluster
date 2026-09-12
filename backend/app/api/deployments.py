@@ -136,13 +136,18 @@ async def create_deployment(
 
     await _check_quota(db, user, targets, tp)
 
-    deps = await deploy_svc.create(
-        db, actor=user.email, served_model_name=name, hf_repo=hf_repo, targets=targets,
-        tensor_parallel_size=tp, spec=spec, max_model_len=max_len,
-        quantization=body.quantization or "", gpu_memory_utilization=body.gpu_memory_utilization,
-        extra_args=body.extra_args, image=body.image,
-        team_id=body.team_id or user.team_id,
-    )
+    try:
+        deps = await deploy_svc.create(
+            db, actor=user.email, served_model_name=name, hf_repo=hf_repo, targets=targets,
+            tensor_parallel_size=tp, spec=spec, max_model_len=max_len,
+            quantization=body.quantization or "", gpu_memory_utilization=body.gpu_memory_utilization,
+            extra_args=body.extra_args, image=body.image,
+            team_id=body.team_id or user.team_id,
+        )
+    except deploy_svc.DeployError as exc:
+        # Drained node, no free port, unknown target: all the caller's problem
+        # to fix, none of them a server fault.
+        raise HTTPException(409, str(exc)) from exc
     return [to_out(d) for d in deps]
 
 
