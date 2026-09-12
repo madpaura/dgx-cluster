@@ -1,0 +1,317 @@
+"""Deployment lifecycle: plan, launch, observe, stop, restart."""
+from __future__ import annotations
+
+from app.drivers import get_driver
+from app.models import Role
+from tests.conftest import pump, register_fleet, set_role
+
+
+# ------------------------------------------------------------------- planning
+
+async def test_plan_reports_where_it_lands_and_the_exact_command(client):
+    await register_fleet(["dgx-01"])
+    plan = (await client.post("/api/deployments/plan", json={"spec_key": "qwen3-32b"})).json()
+
+    assert plan["tensor_parallel_size"] == 2          # from the catalog entry
+    assert plan["per_gpu_gb"] == 40.0
+    assert plan["placements"][0]["node_name"] == "dgx-01"
+    assert plan["placements"][0]["gpu_indices"] == [0, 1]
+
+    argv = plan["argv"]
+    assert argv[argv.index("--model") + 1] == "Qwen/Qwen3-32B"
+    assert argv[argv.index("--served-model-name") + 1] == "qwen3-32b"
+    assert argv[argv.index("--tensor-parallel-size") + 1] == "2"
+    assert "--enable-prefix-caching" in argv           # catalog extra_args
+
+
+async def test_plan_explains_every_rejection(client):
+    await register_fleet(["rtx-ws-01", "dgx-04"])
+    plan = (await client.post("/api/deployments/plan", json={
+        "hf_repo": "meta-llama/Llama-3.1-405B", "tensor_parallel_size": 8,
+    })).json()
+    assert plan["placements"] == []
+    reasons = {r["node_name"]: r["reason"] for r in plan["rejections"]}
+    assert reasons["rtx-ws-01"] == "has 2 GPUs, needs 8"
+    assert reasons["dgx-04"] == "node is unreachable"
+
+
+async def test_plan_sizes_an_uncatalogued_model_from_its_repo_name(client):
+    await register_fleet(["dgx-01"])
+    small = (await client.post("/api/deployments/plan", json={"hf_repo": "org/thing-8b"})).json()
+    big = (await client.post("/api/deployments/plan", json={"hf_repo": "org/thing-70b"})).json()
+    quant = (await client.post("/api/deployments/plan", json={"hf_repo": "org/thing-70b-fp8"})).json()
+    assert small["per_gpu_gb"] < big["per_gpu_gb"]
+    assert quant["per_gpu_gb"] < big["per_gpu_gb"], "a quantised build must be sized smaller"
+
+
+async def test_plan_can_be_scoped_to_a_shortlist_of_nodes(client):
+    ids = await register_fleet(["dgx-01", "dgx-02"])
+    plan = (await client.post("/api/deployments/plan", json={
+        "spec_key": "llama3.1-8b", "node_ids": [ids["dgx-02"]],
+    })).json()
+    assert [p["node_name"] for p in plan["placements"]] == ["dgx-02"]
+
+
+async def test_plan_requires_a_model(client):
+    assert (await client.post("/api/deployments/plan", json={})).status_code == 400
+    assert (await client.post("/api/deployments/plan", json={"spec_key": "ghost"})).status_code == 404
+
+
+# ------------------------------------------------------------------ launching
+
+async def test_deploy_launches_a_container_with_the_planned_arguments(client):
+    await register_fleet(["dgx-01"])
+    dep = (await client.post("/api/deployments", json={"spec_key": "qwen3-32b", "replicas": 1})).json()[0]
+
+    assert dep["status"] == "starting"
+    assert dep["gpu_indices"] == [0, 1]
+    assert dep["tensor_parallel_size"] == 2
+    assert dep["port"] == 8100
+    assert dep["container_name"].startswith("dgxctl-qwen3-32b-")
+    assert dep["endpoint"] == "http://dgx-01.sim.local:8100"
+
+    # and the fake node really is running it, labelled back to the deployment
+    containers = await get_driver().list_containers(type("N", (), {"name": "dgx-01"})())
+    assert containers[0].labels["dgxctl.deployment"] == dep["id"]
+
+
+async def test_replicas_spread_across_nodes_not_onto_one(client):
+    """One node failing must never take a whole model offline."""
+    await register_fleet(["dgx-01", "dgx-02", "dgx-03"])
+    deps = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 3})).json()
+    assert len({d["node_name"] for d in deps}) == 3
+    assert len({d["served_model_name"] for d in deps}) == 1
+
+
+async def test_partial_placement_returns_what_it_could_place(client):
+    await register_fleet(["rtx-ws-01"])
+    deps = (await client.post("/api/deployments", json={"spec_key": "qwen3-32b", "replicas": 4})).json()
+    assert len(deps) == 1, "only one node can host it; the rest are reported as short"
+
+
+async def test_no_capacity_is_a_409_with_the_reason(client):
+    await register_fleet(["rtx-ws-01"])
+    r = await client.post("/api/deployments", json={
+        "hf_repo": "meta-llama/Llama-3.1-405B", "tensor_parallel_size": 8, "replicas": 1,
+    })
+    assert r.status_code == 409
+    assert "has 2 GPUs, needs 8" in r.json()["detail"]
+
+
+async def test_explicit_gpu_targets_are_honoured(client):
+    ids = await register_fleet(["dgx-01"])
+    dep = (await client.post("/api/deployments", json={
+        "spec_key": "qwen3-32b",
+        "targets": [{"node_id": ids["dgx-01"], "gpu_indices": [4, 5]}],
+    })).json()[0]
+    assert dep["gpu_indices"] == [4, 5]
+
+
+async def test_double_booking_a_gpu_is_refused(client):
+    ids = await register_fleet(["dgx-01"])
+    await client.post("/api/deployments", json={
+        "spec_key": "llama3.1-8b", "targets": [{"node_id": ids["dgx-01"], "gpu_indices": [0]}]})
+    r = await client.post("/api/deployments", json={
+        "spec_key": "llama3.1-8b", "targets": [{"node_id": ids["dgx-01"], "gpu_indices": [0]}]})
+    assert r.status_code == 409
+    assert "GPU [0] already in use" in r.json()["detail"]
+
+
+async def test_targeting_a_gpu_that_does_not_exist_is_refused(client):
+    ids = await register_fleet(["rtx-ws-01"])
+    r = await client.post("/api/deployments", json={
+        "spec_key": "llama3.1-8b", "targets": [{"node_id": ids["rtx-ws-01"], "gpu_indices": [7]}]})
+    assert r.status_code == 400
+    assert "has no GPU [7]" in r.json()["detail"]
+
+
+async def test_ports_are_allocated_without_collision(client):
+    await register_fleet(["dgx-01"])
+    ports = set()
+    for _ in range(3):
+        dep = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+        ports.add(dep["port"])
+    assert ports == {8100, 8101, 8102}
+
+
+async def test_a_stopped_deployment_releases_its_port(client):
+    await register_fleet(["dgx-01"])
+    first = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+    await client.post(f"/api/deployments/{first['id']}/stop")
+    second = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+    assert second["port"] == first["port"]
+
+
+async def test_replicas_must_be_sane(client):
+    await register_fleet(["dgx-01"])
+    assert (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 0})).status_code == 400
+    assert (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 99})).status_code == 400
+
+
+# -------------------------------------------------------------- observability
+
+async def test_a_deployment_becomes_healthy_and_reports_metrics(client):
+    await register_fleet(["dgx-01"])
+    dep = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+    await pump(2, gap=0.6)
+
+    after = (await client.get(f"/api/deployments/{dep['id']}")).json()
+    assert after["status"] == "healthy"
+    assert after["status_reason"] == "serving"
+    assert after["healthy_since"] is not None
+
+    m = after["last_metrics"]
+    assert m["gen_tps"] > 0, "throughput must be derived once there are two samples"
+    assert m["kv_cache_pct"] > 0
+    assert m["ttft_avg_ms"] > 0
+
+
+async def test_series_accumulates_samples_for_charting(client):
+    await register_fleet(["dgx-01"])
+    dep = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+    await pump(3)
+    points = (await client.get(f"/api/deployments/{dep['id']}/series")).json()["points"]
+    assert len(points) >= 2
+    assert {"gen_tps", "running", "kv_cache_pct", "ttft_ms"} <= set(points[0]["values"])
+
+
+async def test_logs_come_back_with_the_shard_progress(client):
+    await register_fleet(["dgx-01"])
+    dep = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+    body = (await client.get(f"/api/deployments/{dep['id']}/logs")).json()
+    assert "Loading safetensors checkpoint shards" in body["text"]
+    assert "Uvicorn running" in body["text"]
+
+
+async def test_a_healthy_deployment_is_not_nagged_about_loading_weights(client):
+    await register_fleet(["dgx-01"])
+    dep = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+    await pump()
+    body = (await client.get(f"/api/deployments/{dep['id']}/logs")).json()
+    assert [f for f in body["findings"] if f["severity"] == "info"] == []
+
+
+async def test_a_model_that_does_not_fit_fails_with_a_cause_and_a_fix(client):
+    """The end-to-end diagnostic path: oversized model -> OOM in the container
+    -> failed status -> a finding that names the fix."""
+    ids = await register_fleet(["rtx-ws-01"])
+    dep = (await client.post("/api/deployments", json={
+        "hf_repo": "meta-llama/Llama-3.3-70B-Instruct", "served_model_name": "too-big",
+        "tensor_parallel_size": 2,
+        "targets": [{"node_id": ids["rtx-ws-01"], "gpu_indices": [0, 1]}],
+    })).json()[0]
+    await pump()
+
+    after = (await client.get(f"/api/deployments/{dep['id']}")).json()
+    assert after["status"] == "failed"
+    assert "exited" in after["status_reason"]
+
+    body = (await client.get(f"/api/deployments/{dep['id']}/logs")).json()
+    oom = next(f for f in body["findings"] if f["code"] == "cuda_oom")
+    assert oom["severity"] == "error"
+    assert "tensor-parallel" in oom["fix"]
+    assert "OutOfMemoryError" in oom["evidence"]
+
+
+async def test_a_failed_deployment_gives_its_gpus_back(client):
+    ids = await register_fleet(["rtx-ws-01"])
+    await client.post("/api/deployments", json={
+        "hf_repo": "meta-llama/Llama-3.3-70B-Instruct", "served_model_name": "too-big",
+        "tensor_parallel_size": 2,
+        "targets": [{"node_id": ids["rtx-ws-01"], "gpu_indices": [0, 1]}]})
+    await pump()
+    plan = (await client.post("/api/deployments/plan", json={"spec_key": "llama3.1-8b"})).json()
+    assert plan["placements"], "GPUs held by a dead deployment must be reusable"
+
+
+async def test_an_unreachable_node_degrades_rather_than_fails_its_models(client):
+    """The model is probably still serving; only our view of it is broken."""
+    await register_fleet(["dgx-01"])
+    dep = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+    await pump()
+    assert (await client.get(f"/api/deployments/{dep['id']}")).json()["status"] == "healthy"
+
+    get_driver()._nodes["dgx-01"].unreachable = True
+    from app.db import SessionLocal
+    from app import worker
+    async with SessionLocal() as s:
+        await worker.inventory_pass(s)
+    await pump()
+
+    after = (await client.get(f"/api/deployments/{dep['id']}")).json()
+    assert after["status"] == "degraded"
+    assert "node unreachable" in after["status_reason"]
+    get_driver()._nodes["dgx-01"].unreachable = False
+
+
+# ------------------------------------------------------------------- lifecycle
+
+async def test_stop_removes_the_container(client):
+    await register_fleet(["dgx-01"])
+    dep = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+    r = await client.post(f"/api/deployments/{dep['id']}/stop")
+    assert r.json()["status"] == "stopped"
+    assert get_driver()._nodes["dgx-01"].containers == {}
+
+
+async def test_restart_recreates_with_identical_arguments(client):
+    await register_fleet(["dgx-01"])
+    dep = (await client.post("/api/deployments", json={"spec_key": "qwen3-32b", "replicas": 1})).json()[0]
+    new = (await client.post(f"/api/deployments/{dep['id']}/restart")).json()
+
+    assert new["id"] != dep["id"]
+    assert new["vllm_args"]["argv"] == dep["vllm_args"]["argv"]
+    assert new["gpu_indices"] == dep["gpu_indices"]
+    assert new["status"] == "starting"
+    assert (await client.get(f"/api/deployments/{dep['id']}")).json()["status"] == "stopped"
+
+
+async def test_bulk_stop_and_restart(client):
+    await register_fleet(["dgx-01", "dgx-02"])
+    deps = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 2})).json()
+    ids = [d["id"] for d in deps]
+
+    restarted = (await client.post("/api/deployments/bulk/restart", json={"deployment_ids": ids})).json()
+    assert len(restarted) == 2
+
+    stopped = (await client.post("/api/deployments/bulk/stop",
+                                 json={"deployment_ids": [d["id"] for d in restarted]})).json()
+    assert {d["status"] for d in stopped} == {"stopped"}
+
+
+async def test_listing_filters_to_active_by_default(client):
+    await register_fleet(["dgx-01"])
+    dep = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+    await client.post(f"/api/deployments/{dep['id']}/stop")
+    assert (await client.get("/api/deployments")).json() == []
+    assert len((await client.get("/api/deployments?active_only=false")).json()) == 1
+
+
+async def test_listing_can_be_scoped_to_a_node(client):
+    ids = await register_fleet(["dgx-01", "dgx-02"])
+    await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 2})
+    only = (await client.get(f"/api/deployments?node_id={ids['dgx-01']}")).json()
+    assert len(only) == 1 and only[0]["node_name"] == "dgx-01"
+
+
+# ------------------------------------------------------------------ permissions
+
+async def test_a_viewer_cannot_deploy(client):
+    await register_fleet(["dgx-01"])
+    await set_role(Role.viewer)
+    r = await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})
+    assert r.status_code == 403
+    assert "requires deployer" in r.json()["detail"]
+
+
+async def test_a_viewer_can_still_plan_and_read(client):
+    await register_fleet(["dgx-01"])
+    await set_role(Role.viewer)
+    assert (await client.post("/api/deployments/plan", json={"spec_key": "llama3.1-8b"})).status_code == 200
+    assert (await client.get("/api/deployments")).status_code == 200
+
+
+async def test_unknown_deployment_is_a_404(client):
+    assert (await client.get("/api/deployments/nope")).status_code == 404
+    assert (await client.post("/api/deployments/nope/stop")).status_code == 404
+    assert (await client.post("/api/deployments/nope/restart")).status_code == 404

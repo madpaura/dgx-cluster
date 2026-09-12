@@ -228,26 +228,9 @@ async def deployment_series(
     )
 
 
-@router.post("/{dep_id}/stop", response_model=DeploymentOut)
-async def stop_deployment(dep_id: str, db: AsyncSession = Depends(get_db), user: User = Depends(require_deployer)):
-    dep = await db.get(Deployment, dep_id)
-    if not dep:
-        raise HTTPException(404, "deployment not found")
-    _assert_owner(user, dep)
-    await deploy_svc.stop(db, dep, actor=user.email)
-    return to_out(dep)
-
-
-@router.post("/{dep_id}/restart", response_model=DeploymentOut)
-async def restart_deployment(dep_id: str, db: AsyncSession = Depends(get_db), user: User = Depends(require_deployer)):
-    dep = await db.get(Deployment, dep_id)
-    if not dep:
-        raise HTTPException(404, "deployment not found")
-    _assert_owner(user, dep)
-    new = await deploy_svc.restart(db, dep, actor=user.email)
-    return to_out(new)
-
-
+# NOTE: the /bulk/* routes must be declared before /{dep_id}/*. FastAPI
+# matches in registration order, so a parameterised path declared first
+# swallows "bulk" as a deployment id and every bulk action 404s.
 @router.post("/bulk/stop", response_model=list[DeploymentOut])
 async def bulk_stop(body: BulkAction, db: AsyncSession = Depends(get_db), user: User = Depends(require_deployer)):
     out = []
@@ -269,6 +252,26 @@ async def bulk_restart(body: BulkAction, db: AsyncSession = Depends(get_db), use
             _assert_owner(user, dep)
             out.append(to_out(await deploy_svc.restart(db, dep, actor=user.email)))
     return out
+
+
+@router.post("/{dep_id}/stop", response_model=DeploymentOut)
+async def stop_deployment(dep_id: str, db: AsyncSession = Depends(get_db), user: User = Depends(require_deployer)):
+    dep = await db.get(Deployment, dep_id)
+    if not dep:
+        raise HTTPException(404, "deployment not found")
+    _assert_owner(user, dep)
+    await deploy_svc.stop(db, dep, actor=user.email)
+    return to_out(dep)
+
+
+@router.post("/{dep_id}/restart", response_model=DeploymentOut)
+async def restart_deployment(dep_id: str, db: AsyncSession = Depends(get_db), user: User = Depends(require_deployer)):
+    dep = await db.get(Deployment, dep_id)
+    if not dep:
+        raise HTTPException(404, "deployment not found")
+    _assert_owner(user, dep)
+    new = await deploy_svc.restart(db, dep, actor=user.email)
+    return to_out(new)
 
 
 def _assert_owner(user: User, dep: Deployment) -> None:

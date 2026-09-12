@@ -63,6 +63,13 @@ class _Node:
 class SimDriver(NodeDriver):
     STARTUP_SECONDS = 25.0  # pull + load weights + warm up
 
+    @property
+    def _fail_at(self) -> float:
+        """When a doomed container dies: partway through loading weights, which
+        is where a real CUDA OOM surfaces. Derived from STARTUP_SECONDS so the
+        two never drift apart."""
+        return self.STARTUP_SECONDS * 0.72
+
     def __init__(self) -> None:
         self._nodes: dict[str, _Node] = {}
         self._rng = random.Random(7)
@@ -201,16 +208,16 @@ class SimDriver(NodeDriver):
                     f"INFO {_ts(c.started + at)} [weight_utils.py:265] Loading safetensors checkpoint shards: "
                     f"{pct}% Completed | {shard}/12"
                 )
-        if c.fail_reason and age > 18:
+        if c.fail_reason and age >= self._fail_at:
             lines += [
-                f"ERROR {_ts(c.started + 18)} [engine.py:389] Engine failed to start",
-                f"ERROR {_ts(c.started + 18)} {c.fail_reason}",
+                f"ERROR {_ts(c.started + self._fail_at)} [engine.py:389] Engine failed to start",
+                f"ERROR {_ts(c.started + self._fail_at)} {c.fail_reason}",
                 "Traceback (most recent call last):",
                 '  File "/usr/local/lib/python3.12/site-packages/vllm/engine/llm_engine.py", line 281, in __init__',
                 "    self.model_executor = executor_class(vllm_config=vllm_config)",
                 f"{c.fail_reason.splitlines()[0]}",
             ]
-        elif age > self.STARTUP_SECONDS:
+        elif age >= self.STARTUP_SECONDS:
             lines += [
                 f"INFO {_ts(c.started + 21)} [gpu_executor.py:76] # GPU blocks: 24812, # CPU blocks: 4096",
                 f"INFO {_ts(c.started + 23)} [model_runner.py:1450] Graph capturing finished in 4 secs.",
@@ -237,7 +244,7 @@ class SimDriver(NodeDriver):
         c = next((x for x in sim.containers.values() if x.port == port), None)
         if c is None or c.state != "running":
             return 0, "connection refused"
-        if time.time() - c.started < self.STARTUP_SECONDS:
+        if time.time() - c.started < self.STARTUP_SECONDS or c.fail_reason:
             return 0, "connection refused (still loading)"
         if path.startswith("/health"):
             return 200, ""
@@ -255,10 +262,10 @@ class SimDriver(NodeDriver):
             if c.state != "running":
                 continue
             age = now - c.started
-            if c.fail_reason and age > 18:
+            if c.fail_reason and age >= self._fail_at:
                 c.state, c.exit_code = "exited", 1
                 continue
-            if age > self.STARTUP_SECONDS:
+            if age >= self.STARTUP_SECONDS:
                 # Advance by real elapsed time so the derived tok/s rates are stable.
                 last = c.last_tick or (c.started + self.STARTUP_SECONDS)
                 dt = max(0.0, min(now - last, 60.0))

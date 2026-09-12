@@ -134,9 +134,18 @@ async def set_role(role: Role, team_id: str | None = None) -> None:
         await session.commit()
 
 
-async def pump(times: int = 1) -> None:
-    """Run one full worker cycle: observe containers, then scrape metrics."""
-    for _ in range(times):
+async def pump(times: int = 1, gap: float = 0.0) -> None:
+    """Run one full worker cycle: observe containers, then scrape metrics.
+
+    `gap` spaces the cycles out. Derived rates need it: summarize() discards a
+    delta shorter than half a second, since a throughput figure measured over a
+    microsecond is noise rather than data.
+    """
+    import asyncio
+
+    for i in range(times):
+        if i and gap:
+            await asyncio.sleep(gap)
         async with SessionLocal() as session:
             await worker.reconcile_pass(session)
         async with SessionLocal() as session:

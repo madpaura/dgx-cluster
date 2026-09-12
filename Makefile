@@ -25,3 +25,9 @@ logs:     ## Tail the API log
 check:    ## Typecheck the frontend and syntax-check the backend
 	cd frontend && npx tsc -b --pretty false
 	cd backend && python3 -m compileall -q app
+
+test:     ## Run the verification suite against the simulated fleet
+	cd backend && ../.venv/bin/python -m pytest -q
+
+test-v:   ## Same, with test names
+	cd backend && ../.venv/bin/python -m pytest -v
