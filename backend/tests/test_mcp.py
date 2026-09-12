@@ -20,6 +20,16 @@ from tests.conftest import pump, register_fleet
 HDRS = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
 
 
+def auth_headers() -> dict:
+    """Authenticate when a token is configured. Running the suite inside the
+    shipped image means production settings apply, token included."""
+    from app.config import settings
+
+    if settings.mcp_token:
+        return {**HDRS, "authorization": f"Bearer {settings.mcp_token}"}
+    return HDRS
+
+
 class Agent:
     """A minimal MCP client: initialize once, then call tools."""
 
@@ -32,7 +42,7 @@ class Agent:
         body = {"jsonrpc": "2.0", "id": self._id, "method": method}
         if params is not None:
             body["params"] = params
-        return await self.http.post("/", headers=HDRS, json=body)
+        return await self.http.post("/", headers=auth_headers(), json=body)
 
     async def initialize(self) -> dict:
         r = await self.rpc("initialize", {

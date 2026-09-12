@@ -50,20 +50,54 @@ The dashboard exposes its own capabilities as an MCP server at `/mcp`
 21 tools the UI is built on — and the same validation, since every tool calls
 the very endpoint function the browser calls.
 
+### Connecting
+
+`./setup.sh mcp` prints everything below, filled in with your generated token.
+
+**Claude Code**
+
+```bash
+claude mcp add --transport http dgxctl http://localhost:8080/mcp/ \
+  --header "Authorization: Bearer $DGXCTL_MCP_TOKEN"
+```
+
+**Claude Desktop / any `mcp.json`**
+
 ```jsonc
-// Claude Code / Claude Desktop
 {
   "mcpServers": {
     "dgxctl": {
       "type": "http",
       "url": "http://dgxctl.your-office.lan:8080/mcp/",
-      "headers": { "Authorization": "Bearer $DGXCTL_MCP_TOKEN" }
+      "headers": { "Authorization": "Bearer <DGXCTL_MCP_TOKEN>" }
     }
   }
 }
 ```
 
-What makes it useful to an agent rather than just callable:
+Note the **trailing slash** on `/mcp/`, and use the host's real name rather than
+`localhost` when connecting from another machine.
+
+**Checking it by hand**
+
+```bash
+curl -s http://localhost:8080/mcp/ \
+  -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' \
+  -H "Authorization: Bearer $DGXCTL_MCP_TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+### The tools
+
+| | |
+|---|---|
+| **Look** | `fleet_summary` · `list_nodes` · `list_models` · `get_deployment` · `list_clusters` · `list_catalog` · `list_events` · `litellm_status` |
+| **Diagnose** | `deployment_logs` · `diagnose_node` · `reconcile_node` |
+| **Serve** | `plan_deployment` · `deploy_model` · `stop_deployment` · `restart_deployment` |
+| **Fleet** | `register_node` · `probe_node` · `drain_node` · `create_cluster` · `move_nodes` · `resync_litellm` |
+
+What makes them useful to an agent rather than just callable:
 
 - **`plan_deployment` is a dry run** that reports which nodes can host a model
   and *why each other one cannot*. `deploy_model` refuses with the same
@@ -77,9 +111,17 @@ What makes it useful to an agent rather than just callable:
 - **Agent actions are attributable.** They run as `agent@mcp`, so the audit log
   distinguishes what an agent did from what a person did.
 
-Set `DGXCTL_MCP_TOKEN` before exposing it: anyone who can reach `/mcp` can stop
-every model in the fleet. Without a token the endpoint refuses to mount unless
-`auth_mode=dev`. Set `DGXCTL_MCP_ENABLED=false` to remove it entirely.
+### Securing it
+
+Anyone who can reach `/mcp` can stop every model in the fleet.
+`./setup.sh check` generates `DGXCTL_MCP_TOKEN` for you; without a token the
+endpoint **refuses to mount** unless `auth_mode=dev`. `DGXCTL_MCP_ENABLED=false`
+removes it entirely.
+
+The MCP transport also validates the `Host` header as DNS-rebinding protection,
+which rejects requests once you reach the server by its real hostname.
+`DGXCTL_MCP_ALLOWED_HOSTS` defaults to `*`, turning that check off and relying
+on the bearer token; set it to a comma-separated host list to turn it back on.
 
 ## Themes
 
@@ -99,42 +141,43 @@ adding your own palette is that one block plus an entry in
 `frontend/src/lib/theme.ts`. (The stylesheet uses `color-mix()` to derive badge
 and hover shades — needs Chrome/Edge 111+, Firefox 113+, Safari 16.2+.)
 
-## Run it right now, with no GPUs
+## Run it
 
-The simulator gives you seven fake nodes — three DGX (H100/A100), three RTX 6000
-Ada workstations, and one deliberately unreachable box — with realistic startup
-delays, VRAM accounting, vLLM-shaped metrics and injected failures.
+Everything is Docker. One script drives it.
+
+```bash
+./setup.sh check     # prerequisites, generates .env and its secrets
+./setup.sh start     # build and start; prints the URLs when healthy
+```
+
+That is a complete, working system: dashboard, API, MCP endpoint, Postgres and
+a LiteLLM proxy. It starts against a **simulated fleet** — seven fake nodes
+(three DGX, three RTX workstations, one deliberately unreachable), with
+realistic startup delays, VRAM accounting, vLLM-shaped metrics and injected
+failures. Deploy models, watch weights load, see a 70B refuse to fit on a 48 GB
+card and be told why. No hardware is touched.
+
+| Command | |
+|---|---|
+| `./setup.sh check` | Prerequisites; creates `.env` and generates secrets |
+| `./setup.sh start` | Build and start everything |
+| `./setup.sh down` | Stop |
+| `./setup.sh restart` | Stop, then start |
+| `./setup.sh status` | Container state and a fleet summary |
+| `./setup.sh logs [api\|litellm\|postgres]` | Tail logs |
+| `./setup.sh test` | Run the verification suite **inside the built image** |
+| `./setup.sh mcp` | Print MCP connection details for an agent |
+| `./setup.sh keygen` | Generate the SSH key to install on the GPU nodes |
+| `./setup.sh clean` | Stop and delete all data (asks first) |
+
+### Without Docker
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install fastapi "uvicorn[standard]" "sqlalchemy[asyncio]" aiosqlite \
-  asyncpg pydantic pydantic-settings asyncssh httpx authlib itsdangerous greenlet
+.venv/bin/pip install -e backend
 cd frontend && npm install && npm run build && cd ..
 make dev-api          # http://localhost:8000
 ```
-
-Everything works: deploy, watch weights load, see a 70B model OOM on a 48 GB
-card and get told why, stop, restart, bulk actions. Nothing touches hardware.
-
-## Verifying it
-
-```bash
-make test        # 238 tests, ~30s, no hardware and no network
-```
-
-The suite runs the whole application in process against the simulated fleet and
-a throwaway database, driving the reconcile loops by hand so each test observes
-a deterministic point in the cycle. It covers placement and its rejection
-reasons, every diagnostic rule, the vLLM metric parser, every HTTP endpoint,
-the reconcile state machine, LiteLLM (against a stand-in proxy that reproduces
-its real failure modes), roles, team quotas, the live-update bus, and the MCP
-endpoint over its real JSON-RPC wire protocol.
-
-The SSH driver is covered too, even though it never runs under the simulator:
-its command construction and its `nvidia-smi` / `docker ps` parsing are tested
-directly, because that is the code most likely to be wrong on the day the fleet
-is real. What cannot be verified without hardware is the SSH transport itself
-and whether vLLM actually loads a given model on your GPUs.
 
 ## Deploy it at the office
 
@@ -157,15 +200,12 @@ The SSH user must be able to run `docker` without a password prompt.
 **2. Bring up the control server:**
 
 ```bash
-ssh-keygen -t ed25519 -f secrets/fleet_key -N ''   # public key goes on the nodes
-cp .env.example .env
-# set DGXCTL_SECRET_KEY, LITELLM_MASTER_KEY, POSTGRES_PASSWORD, and DGXCTL_DRIVER=ssh
-docker compose up -d --build
+./setup.sh keygen     # prints the public key to install in step 1
+./setup.sh check      # writes .env with generated secrets
+# edit .env: set DGXCTL_DRIVER=ssh (and DGXCTL_SSH_USER if not root)
+./setup.sh start
+./setup.sh test       # optional: prove this build works before trusting it
 ```
-
-Open `http://<control-server>:8080`, make a cluster or two (**+ Cluster**), then
-**+ Node** for each machine. dgxctl probes each one immediately — you either see
-its GPUs or the exact SSH error.
 
 **3. Point your users at the proxy:**
 

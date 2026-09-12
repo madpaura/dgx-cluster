@@ -109,6 +109,17 @@ classifies exactly as it would in production.
 One environment variable switches to the real fleet. Nothing above the driver
 layer knows the difference.
 
+## LiteLLM gets its own database
+
+Both services use the same Postgres instance but **different databases**, and
+that separation is load-bearing rather than tidiness. LiteLLM manages its schema
+with Prisma, which treats the `public` schema of the database it is pointed at
+as its own: on first migration it drops the tables it does not recognise. Point
+it at dgxctl's database and the node inventory, deployments, clusters and audit
+log are destroyed — quietly, a minute or two after a start that looked fine.
+
+`postgres/10-litellm-db.sh` creates the second database on first boot.
+
 ## What is deliberately not here
 
 - **No scheduler queue.** Deployments are long-lived services, not jobs. If you

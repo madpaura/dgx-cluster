@@ -19,9 +19,16 @@ COPY backend/pyproject.toml ./
 RUN pip install --no-cache-dir \
       "fastapi>=0.115" "uvicorn[standard]>=0.32" "sqlalchemy[asyncio]>=2.0.36" \
       "asyncpg>=0.30" "pydantic>=2.9" "pydantic-settings>=2.6" "asyncssh>=2.18" \
-      "httpx>=0.27" "authlib>=1.3" "itsdangerous>=2.2" "greenlet>=3.1" "mcp>=2.2"
+      "httpx>=0.27" "authlib>=1.3" "itsdangerous>=2.2" "greenlet>=3.1" "mcp>=2.2" \
+ && pip install --no-cache-dir pytest pytest-asyncio aiosqlite
 
 COPY backend/app ./app
+# The verification suite ships with the image: `./setup.sh test` proves the
+# build you are about to run on real hardware is sound, using the simulated
+# fleet. Small, and the only way to check the deployed artifact rather than
+# a developer's checkout.
+COPY backend/tests ./tests
+COPY backend/pytest.ini ./
 COPY --from=ui /backend/static ./static
 
 EXPOSE 8000

@@ -13,6 +13,8 @@ services:
       POSTGRES_DB: dgxctl
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Gives LiteLLM its own database; see the script for why that matters.
+      - ./postgres:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U dgxctl"]
       interval: 5s
@@ -61,7 +63,9 @@ services:
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
       LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:-${LITELLM_MASTER_KEY}}
-      DATABASE_URL: postgresql://dgxctl:${POSTGRES_PASSWORD:-dgxctl}@postgres:5432/dgxctl
+      # A SEPARATE database from dgxctl's. Prisma drops unknown tables in the
+      # schema it migrates, so sharing one destroys the fleet inventory.
+      DATABASE_URL: postgresql://dgxctl:${POSTGRES_PASSWORD:-dgxctl}@postgres:5432/litellm
       STORE_MODEL_IN_DB: "True"
     volumes:
       - ./litellm/config.yaml:/app/config.yaml:ro
