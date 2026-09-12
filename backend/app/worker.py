@@ -116,7 +116,13 @@ async def _reconcile_one(db: AsyncSession, dep: Deployment, container) -> None:
         if dep.status != DeployStatus.healthy:
             await _transition(db, dep, DeployStatus.healthy, "serving")
             dep.healthy_since = datetime.now(timezone.utc)
-            await _register_litellm(db, dep)
+            await _register_litellm(db, dep, announce=True)
+        elif not dep.litellm_registered:
+            # Keep trying. A model that went healthy while the proxy was still
+            # booting — the normal case after restarting the control plane —
+            # would otherwise stay unrouted until a human noticed. Quietly,
+            # because the first failure was already reported.
+            await _register_litellm(db, dep, announce=False)
         return
 
     # Running but not answering: fine while loading, a problem once the grace period ends.
@@ -126,19 +132,25 @@ async def _reconcile_one(db: AsyncSession, dep: Deployment, container) -> None:
         await _transition(db, dep, DeployStatus.starting, "loading weights")
 
 
-async def _register_litellm(db: AsyncSession, dep: Deployment) -> None:
+async def _register_litellm(db: AsyncSession, dep: Deployment, *, announce: bool) -> None:
+    """Register a healthy deployment with the proxy.
+
+    `announce=False` is a retry: report success, but stay quiet about failure so
+    an unreachable proxy does not fill the event feed once per poll.
+    """
     if dep.litellm_registered or not settings.litellm_auto_register:
         return
     ok, msg = await litellm_svc.sync_deployment(dep, register=True)
     dep.litellm_registered = ok
     if ok:
         dep.litellm_model_id = dep.id
-    await audit.emit(
-        db,
-        severity="info" if ok else "warning",
-        source="litellm", source_id=dep.id,
-        message=msg if ok else f"LiteLLM registration failed for {dep.served_model_name}: {msg}",
-    )
+    if ok or announce:
+        await audit.emit(
+            db,
+            severity="info" if ok else "warning",
+            source="litellm", source_id=dep.id,
+            message=msg if ok else f"LiteLLM registration failed for {dep.served_model_name}: {msg}",
+        )
 
 
 async def _transition(db: AsyncSession, dep: Deployment, status: DeployStatus, reason: str) -> None:

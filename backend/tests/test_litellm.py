@@ -243,3 +243,31 @@ async def test_a_proxy_error_response_is_reported_not_swallowed(client, proxy):
 
     warning = next(e for e in (await client.get("/api/events")).json() if e["source"] == "litellm")
     assert "No DB Connected" in warning["message"]
+
+
+async def test_registration_retries_until_the_proxy_comes_back(client, proxy):
+    """Restarting the control plane brings models up before the proxy finishes
+    booting. Without a retry they would stay unrouted until a human noticed."""
+    proxy["down"] = True
+    await register_fleet(["dgx-01"])
+    dep = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+    await pump()
+    assert (await client.get(f"/api/deployments/{dep['id']}")).json()["litellm_registered"] is False
+
+    proxy["down"] = False
+    await pump()
+
+    assert (await client.get(f"/api/deployments/{dep['id']}")).json()["litellm_registered"] is True
+    assert dep["id"] in proxy["models"]
+
+
+async def test_a_retry_does_not_flood_the_event_feed(client, proxy):
+    """An unreachable proxy must be reported once, not once per poll."""
+    proxy["down"] = True
+    await register_fleet(["dgx-01"])
+    await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})
+    await pump(4)
+
+    warnings = [e for e in (await client.get("/api/events")).json()
+                if e["source"] == "litellm" and e["severity"] == "warning"]
+    assert len(warnings) == 1, f"expected one warning, got {len(warnings)}"
