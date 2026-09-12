@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
@@ -18,6 +19,12 @@ from ..services.placement import busy_gpu_indices
 
 router = APIRouter(prefix="/api", tags=["fleet"])
 
+# A deployment that died days ago and was never cleaned up is history, not a
+# problem. The summary is a "right now" indicator, so it counts only failures
+# recent enough to still be worth acting on. The full record stays available
+# through /api/deployments?active_only=false and the activity feed.
+RECENT_FAILURE_WINDOW = timedelta(hours=1)
+
 
 @router.get("/summary", response_model=FleetSummary)
 async def summary(db: AsyncSession = Depends(get_db), _: User = Depends(current_user)):
@@ -33,6 +40,11 @@ async def summary(db: AsyncSession = Depends(get_db), _: User = Depends(current_
     vram_total = sum(g.memory_total_mb for n in nodes for g in n.gpus) / 1024
     vram_used = sum(g.memory_used_mb for n in nodes for g in n.gpus) / 1024
 
+    cutoff = datetime.now(timezone.utc) - RECENT_FAILURE_WINDOW
+    recent_failures = [
+        d for d in deps
+        if d.status == DeployStatus.failed and _as_utc(d.created_at) >= cutoff
+    ]
     healthy = [d for d in deps if d.status == DeployStatus.healthy]
     tps = sum(float(d.last_metrics.get("gen_tps", 0) or 0) for d in healthy)
     running = sum(int(d.last_metrics.get("running", 0) or 0) for d in healthy)
@@ -55,13 +67,20 @@ async def summary(db: AsyncSession = Depends(get_db), _: User = Depends(current_
         vram_used_gb=round(vram_used, 1),
         deployments_healthy=len(healthy),
         deployments_degraded=sum(1 for d in deps if d.status == DeployStatus.degraded),
-        deployments_failed=sum(1 for d in deps if d.status == DeployStatus.failed),
+        deployments_failed=len(recent_failures),
         models_served=len({d.served_model_name for d in healthy}),
         tokens_per_second=round(tps, 1),
         requests_running=running,
         requests_waiting=waiting,
         litellm_reachable=litellm_ok,
     )
+
+
+def _as_utc(value: datetime | None) -> datetime:
+    """created_at is stored as UTC, but not every backend returns tzinfo."""
+    if value is None:
+        return datetime.now(timezone.utc)
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 @router.get("/events", response_model=list[EventOut])

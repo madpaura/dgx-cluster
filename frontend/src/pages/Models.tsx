@@ -3,7 +3,7 @@ import { DeployDialog } from "../components/DeployDialog";
 import { DeploymentDrawer } from "../components/DeploymentDrawer";
 import { Confirm, Pill, useToast } from "../components/ui";
 import { api, ApiError, useLiveEvents, usePolled } from "../lib/api";
-import { DEPLOY_TONE, ago, fmtNum } from "../lib/format";
+import { DEPLOY_TONE, ago, fmtNum, parseTs } from "../lib/format";
 import type { Deployment, Me, ModelSpec } from "../types";
 
 /** Models, not containers. Replicas of one served name collapse into a single
@@ -15,7 +15,7 @@ export function Models({ me }: { me: Me | null }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deploying, setDeploying] = useState(false);
-  const [showStopped, setShowStopped] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
   const [confirmBulk, setConfirmBulk] = useState<null | "stop" | "restart">(null);
   const [busy, setBusy] = useState(false);
   const toast = useToast();
@@ -24,11 +24,20 @@ export function Models({ me }: { me: Me | null }) {
   const canDeploy = me?.role === "admin" || me?.role === "deployer";
 
   const groups = useMemo(() => {
-    const rows = (deps ?? []).filter((d) => showStopped || d.status !== "stopped");
+    // "3 of 47 healthy" is worse than useless once a few node reboots have
+    // accumulated corpses. By default a replica count means replicas that
+    // exist now, plus failures fresh enough to still be worth acting on.
+    const fresh = Date.now() - 3_600_000;
+    const rows = (deps ?? []).filter((d) => {
+      if (showHistory) return true;
+      if (d.status === "stopped") return false;
+      if (d.status === "failed") return parseTs(d.created_at).getTime() >= fresh;
+      return true;
+    });
     const map = new Map<string, Deployment[]>();
     rows.forEach((d) => map.set(d.served_model_name, [...(map.get(d.served_model_name) ?? []), d]));
     return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-  }, [deps, showStopped]);
+  }, [deps, showHistory]);
 
   function toggleSel(ids: string[], on: boolean) {
     setSelected((prev) => {
@@ -62,10 +71,10 @@ export function Models({ me }: { me: Me | null }) {
           <input
             type="checkbox"
             style={{ width: "auto" }}
-            checked={showStopped}
-            onChange={(e) => setShowStopped(e.target.checked)}
+            checked={showHistory}
+            onChange={(e) => setShowHistory(e.target.checked)}
           />
-          Show stopped
+          Show stopped and old failures
         </label>
         <div className="right">
           <button className="btn primary" disabled={!canDeploy} onClick={() => setDeploying(true)}>

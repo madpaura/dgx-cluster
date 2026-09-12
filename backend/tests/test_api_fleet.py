@@ -103,3 +103,34 @@ async def test_runtime_config_tells_the_ui_it_is_simulated(client):
 async def test_healthz_needs_no_auth(client):
     r = await client.get("/healthz")
     assert r.status_code == 200 and r.json()["ok"] is True
+
+
+async def test_the_summary_ignores_failures_that_are_no_longer_actionable(client):
+    """Node reboots accumulate dead deployments. Counting them forever turns
+    the headline number into noise that hides a real, current failure."""
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import select
+
+    from app.db import SessionLocal
+    from app.models import Deployment
+
+    ids = await register_fleet(["rtx-ws-01"])
+    await client.post("/api/deployments", json={
+        "hf_repo": "meta-llama/Llama-3.3-70B-Instruct", "served_model_name": "too-big",
+        "tensor_parallel_size": 2,
+        "targets": [{"node_id": ids["rtx-ws-01"], "gpu_indices": [0, 1]}]})
+    await pump()
+    assert (await client.get("/api/summary")).json()["deployments_failed"] == 1
+
+    # age it past the window
+    async with SessionLocal() as s:
+        row = await s.execute(select(Deployment))
+        dep = row.scalars().first()
+        dep.created_at = datetime.now(timezone.utc) - timedelta(hours=3)
+        await s.commit()
+
+    assert (await client.get("/api/summary")).json()["deployments_failed"] == 0
+    # ...but the record is still there for anyone who asks
+    all_deps = (await client.get("/api/deployments?active_only=false")).json()
+    assert [d["status"] for d in all_deps] == ["failed"]
