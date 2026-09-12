@@ -5,7 +5,8 @@ Three loops, all idempotent, all safe to restart:
   reconcile  - observe containers, move deployments to their true status,
                register newly-healthy models with LiteLLM
   metrics    - scrape vLLM /metrics for anything healthy
-Plus a retention sweep so the samples table cannot grow without bound.
+Plus a retention sweep so metric samples, events and the audit log cannot
+grow without bound.
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from . import audit, events
 from .config import settings
 from .db import SessionLocal
 from .drivers import get_driver
-from .models import ACTIVE_STATUSES, Deployment, DeployStatus, MetricSample, Node, NodeStatus
+from .models import ACTIVE_STATUSES, AuditLog, Deployment, DeployStatus, Event, MetricSample, Node, NodeStatus
 from .services import litellm as litellm_svc
 from .services import nodes as node_svc
 from .services.deployments import LABEL_KEY, startup_expired
@@ -232,8 +233,18 @@ async def litellm_pass(db: AsyncSession) -> None:
 # ------------------------------------------------------------------ retention
 
 async def retention_pass(db: AsyncSession) -> None:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.metric_retention_hours)
-    await db.execute(delete(MetricSample).where(MetricSample.ts < cutoff))
+    metric_cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.metric_retention_hours)
+    await db.execute(delete(MetricSample).where(MetricSample.ts < metric_cutoff))
+
+    event_cutoff = datetime.now(timezone.utc) - timedelta(days=settings.event_retention_days)
+    await db.execute(delete(Event).where(Event.ts < event_cutoff))
+
+    # The audit log outlives the event feed on purpose: it is the record of
+    # who did what, and it is kept long after the operational noise it
+    # happened alongside has been trimmed away.
+    audit_cutoff = datetime.now(timezone.utc) - timedelta(days=settings.audit_retention_days)
+    await db.execute(delete(AuditLog).where(AuditLog.ts < audit_cutoff))
+
     await db.commit()
 
 

@@ -21,6 +21,16 @@ services:
       timeout: 3s
       retries: 20
     restart: unless-stopped
+    # This box holds node inventory and the audit log, not model weights —
+    # a small, fixed footprint. Capped so a runaway query degrades one
+    # container instead of starving the host it shares with the GPU driver.
+    mem_limit: 1g
+    cpus: "1"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   api:
     build:
@@ -34,6 +44,11 @@ services:
       DGXCTL_DRIVER: ${DGXCTL_DRIVER:-sim}
       DGXCTL_SSH_USER: ${DGXCTL_SSH_USER:-root}
       DGXCTL_SSH_KEY_PATH: /run/secrets/fleet_key
+      # Empty (the default) accepts whatever host key a node presents. Set
+      # DGXCTL_SSH_KNOWN_HOSTS=/run/secrets/known_hosts in .env, alongside the
+      # mount below, once you have captured real host keys.
+      DGXCTL_SSH_KNOWN_HOSTS: ${DGXCTL_SSH_KNOWN_HOSTS:-}
+      DGXCTL_MCP_ROLE: ${DGXCTL_MCP_ROLE:-admin}
       DGXCTL_VLLM_IMAGE: ${DGXCTL_VLLM_IMAGE:-vllm/vllm-openai:latest}
       DGXCTL_HF_CACHE_DIR: ${DGXCTL_HF_CACHE_DIR:-/opt/hf-cache}
       DGXCTL_HF_TOKEN: ${DGXCTL_HF_TOKEN:-}
@@ -52,9 +67,26 @@ services:
     volumes:
       # The control server's SSH key. Must be in authorized_keys on every node.
       - ${FLEET_SSH_KEY:-./secrets/fleet_key}:/run/secrets/fleet_key:ro
+      # Only read if DGXCTL_SSH_KNOWN_HOSTS above points here. Build it with
+      # `ssh-keyscan -H <node> >> secrets/known_hosts` for every node; an empty
+      # file at the default path is harmless while the feature is unused.
+      - ${SSH_KNOWN_HOSTS_FILE:-./secrets/known_hosts}:/run/secrets/known_hosts:ro
     ports:
-      - "${DGXCTL_PORT:-8080}:8000"
+      # Bound to loopback by default: DGXCTL_AUTH_MODE defaults to "dev", which
+      # trusts every request as admin, so publishing this on the LAN by
+      # default would make a fresh install an open control plane. Set
+      # DGXCTL_BIND_ADDRESS=0.0.0.0 once auth is actually configured.
+      - "${DGXCTL_BIND_ADDRESS:-127.0.0.1}:${DGXCTL_PORT:-8080}:8000"
     restart: unless-stopped
+    # The control plane itself is a thin FastAPI process; GPU work happens on
+    # the fleet, not here. Capped mainly to contain a leak, not to pinch it.
+    mem_limit: 1g
+    cpus: "2"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   litellm:
     image: ghcr.io/berriai/litellm:main-stable
@@ -71,8 +103,27 @@ services:
       - ./litellm/config.yaml:/app/config.yaml:ro
     command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "4"]
     ports:
-      - "${LITELLM_PORT:-4000}:4000"
+      # See the api service above: loopback by default, deliberately opened.
+      - "${DGXCTL_BIND_ADDRESS:-127.0.0.1}:${LITELLM_PORT:-4000}:4000"
+    healthcheck:
+      # No curl/wget in this image (Wolfi base); it does ship its own Python.
+      # /health/readiness is the same endpoint app/services/litellm.py polls.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request as u; u.urlopen('http://localhost:4000/health/readiness', timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      # Prisma migrations plus proxy boot take ~90s; failing health checks
+      # during that window would otherwise flap the container's state.
+      start_period: 100s
+      retries: 6
     restart: unless-stopped
+    mem_limit: 2g
+    cpus: "2"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   pgdata:

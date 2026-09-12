@@ -1,7 +1,24 @@
 """Fleet summary, the activity feed, and the audit trail."""
 from __future__ import annotations
 
+import pytest
+from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
+
+from app.api import fleet as fleet_module
+from app.main import app
 from tests.conftest import pump, register_fleet
+
+
+@pytest.fixture(autouse=True)
+def _reset_litellm_cache():
+    """Every test starts and ends with a cold cache, so a reachability answer
+    from one test can never leak into the next."""
+    fleet_module._litellm_cache["checked_at"] = 0.0
+    fleet_module._litellm_cache["reachable"] = False
+    yield
+    fleet_module._litellm_cache["checked_at"] = 0.0
+    fleet_module._litellm_cache["reachable"] = False
 
 
 async def test_summary_adds_up_across_the_fleet(client):
@@ -134,3 +151,85 @@ async def test_the_summary_ignores_failures_that_are_no_longer_actionable(client
     # ...but the record is still there for anyone who asks
     all_deps = (await client.get("/api/deployments?active_only=false")).json()
     assert [d["status"] for d in all_deps] == ["failed"]
+
+
+async def test_summary_does_not_re_ask_litellm_within_the_cache_window(client, monkeypatch):
+    """A slow or hung proxy must not stall the dashboard poll every 6 seconds."""
+    calls = {"n": 0}
+
+    class CountingClient:
+        async def health(self):
+            calls["n"] += 1
+            return {"reachable": True, "detail": {}}
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(fleet_module, "LiteLLMClient", CountingClient)
+    await register_fleet(["dgx-01"])
+
+    first = (await client.get("/api/summary")).json()
+    second = (await client.get("/api/summary")).json()
+
+    assert calls["n"] == 1
+    assert first["litellm_reachable"] is True
+    assert second["litellm_reachable"] is True
+
+
+async def test_the_websocket_rejects_an_unauthenticated_connection(monkeypatch):
+    """Node names, model names, GPU metrics and fleet events must not be
+    handed to anyone who can merely reach the port."""
+    monkeypatch.setattr(fleet_module.settings, "auth_mode", "oidc")
+
+    # No `with TestClient(app) as tc:` here: entering it runs the app's real
+    # startup (migrations, seeding, worker loops), which this check has no use
+    # for and which fights with the schema `fresh_db` already built for this
+    # test. A plain instance still opens a websocket for one request.
+    tc = TestClient(app)
+    with pytest.raises(WebSocketDisconnect):
+        with tc.websocket_connect("/api/ws"):
+            pass
+
+
+async def test_the_websocket_still_works_with_no_login_in_dev_mode():
+    """Dev mode signs everyone in as admin everywhere else in the app; the
+    live feed must not be the one place that breaks that promise."""
+    tc = TestClient(app)
+    with tc.websocket_connect("/api/ws") as ws:
+        hello = ws.receive_json()
+        assert hello == {"topic": "hello", "data": {"driver": "sim"}}
+
+
+async def test_retention_trims_stale_events_while_the_audit_log_outlives_them(monkeypatch):
+    """The audit log is the record of who did what, so it is kept long after
+    the operational noise it happened alongside has been trimmed away."""
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import select
+
+    from app import worker
+    from app.db import SessionLocal
+    from app.models import AuditLog, Event
+
+    monkeypatch.setattr(worker.settings, "event_retention_days", 1)
+    monkeypatch.setattr(worker.settings, "audit_retention_days", 30)
+
+    stale = datetime.now(timezone.utc) - timedelta(days=5)
+    fresh = datetime.now(timezone.utc)
+
+    async with SessionLocal() as db:
+        db.add(Event(ts=stale, severity="info", source="node", message="stale"))
+        db.add(Event(ts=fresh, severity="info", source="node", message="fresh"))
+        db.add(AuditLog(ts=stale, actor="dev@localhost", action="node.drain", summary="stale"))
+        db.add(AuditLog(ts=fresh, actor="dev@localhost", action="node.drain", summary="fresh"))
+        await db.commit()
+
+    async with SessionLocal() as db:
+        await worker.retention_pass(db)
+
+    async with SessionLocal() as db:
+        events_left = {e.message for e in (await db.execute(select(Event))).scalars()}
+        audit_left = {a.summary for a in (await db.execute(select(AuditLog))).scalars()}
+
+    assert events_left == {"fresh"}, "an event older than the retention window must not linger"
+    assert audit_left == {"stale", "fresh"}, "the audit trail outlives the event feed on purpose"

@@ -1,0 +1,37 @@
+# backend/Dockerfile builds with the repo root as context (a two-stage build:
+# frontend/ sources for the UI stage, backend/ sources for the API stage), so
+# excludes here have to leave both of those trees intact. Everything else is
+# either regenerated inside the image or never touched by a COPY at all.
+
+# The fleet SSH private key and any materialised env file. These must never
+# reach a build context — a layer that ever held them keeps them, in the
+# local build cache and in any image that gets pushed or exported.
+secrets/
+.env
+.env.*
+!.env.example
+
+# Reinstalled from backend/pyproject.toml inside the image. Shipping the
+# host's own venv also risks baking in a different Python ABI/platform.
+.venv/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+*.db
+
+# The UI stage runs its own `npm ci` against frontend/package-lock.json, so
+# the host's node_modules (rebuilt for the container's platform anyway) and
+# prior build output are dead weight in the context, not inputs to it.
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# Version control metadata; irrelevant to what gets built.
+.git/
+.gitignore
+
+# Read by docker compose / operators, never by the image build.
+docker-compose.yml
+Makefile
+docs/
+*.md

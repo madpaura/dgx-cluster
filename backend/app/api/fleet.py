@@ -9,10 +9,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import events
-from ..auth import current_user
+from ..auth import DEV_EMAIL, current_user, upsert_user
 from ..config import settings
 from ..db import get_db
-from ..models import ACTIVE_STATUSES, AuditLog, Deployment, DeployStatus, Event, Node, NodeStatus, User
+from ..models import ACTIVE_STATUSES, AuditLog, Deployment, DeployStatus, Event, Node, NodeStatus, Role, User
 from ..schemas import AuditOut, EventOut, FleetSummary
 from ..services.litellm import LiteLLMClient
 from ..services.placement import busy_gpu_indices
@@ -24,6 +24,26 @@ router = APIRouter(prefix="/api", tags=["fleet"])
 # recent enough to still be worth acting on. The full record stays available
 # through /api/deployments?active_only=false and the activity feed.
 RECENT_FAILURE_WINDOW = timedelta(hours=1)
+
+# The dashboard polls /api/summary every few seconds per open tab; asking
+# LiteLLM fresh on each of those would mean a slow or hung proxy stalls the
+# whole dashboard for everyone watching it. A stale-by-seconds reachability
+# answer is fine, a blocked poll loop is not.
+_litellm_cache: dict[str, object] = {"checked_at": 0.0, "reachable": False}
+
+
+async def _litellm_reachable() -> bool:
+    now = asyncio.get_running_loop().time()
+    if now - _litellm_cache["checked_at"] < settings.summary_cache_seconds:
+        return bool(_litellm_cache["reachable"])
+    client = LiteLLMClient()
+    try:
+        reachable = (await client.health())["reachable"]
+    finally:
+        await client.close()
+    _litellm_cache["checked_at"] = now
+    _litellm_cache["reachable"] = reachable
+    return reachable
 
 
 @router.get("/summary", response_model=FleetSummary)
@@ -50,11 +70,7 @@ async def summary(db: AsyncSession = Depends(get_db), _: User = Depends(current_
     running = sum(int(d.last_metrics.get("running", 0) or 0) for d in healthy)
     waiting = sum(int(d.last_metrics.get("waiting", 0) or 0) for d in healthy)
 
-    client = LiteLLMClient()
-    try:
-        litellm_ok = (await client.health())["reachable"]
-    finally:
-        await client.close()
+    litellm_ok = await _litellm_reachable()
 
     return FleetSummary(
         nodes_total=len(nodes),
@@ -118,9 +134,33 @@ async def runtime_config(_: User = Depends(current_user)):
     }
 
 
+async def _authenticate_socket(socket: WebSocket, db: AsyncSession) -> User | None:
+    """Same identity check as `current_user`, adapted for a connection that
+    cannot carry an Authorization header — a browser attaches the session
+    cookie to a WebSocket upgrade automatically, so that is what stands in
+    for it here."""
+    if settings.auth_mode == "dev":
+        row = await db.execute(select(User).where(User.email == DEV_EMAIL))
+        user = row.scalar_one_or_none()
+        if user is None:
+            user = await upsert_user(db, email=DEV_EMAIL, name="Local Admin", role=Role.admin)
+        return user
+
+    sess = socket.session.get("user")
+    if not sess:
+        return None
+    row = await db.execute(select(User).where(User.email == sess["email"]))
+    return row.scalar_one_or_none()
+
+
 @router.websocket("/ws")
-async def ws(socket: WebSocket):
+async def ws(socket: WebSocket, db: AsyncSession = Depends(get_db)):
     """Live fleet feed: node/gpu updates, deployment transitions, metrics, events."""
+    user = await _authenticate_socket(socket, db)
+    if user is None:
+        # Reject before accept: a signed-out caller never gets the stream.
+        await socket.close(code=4401)
+        return
     await socket.accept()
     with events.subscription() as q:
         try:
