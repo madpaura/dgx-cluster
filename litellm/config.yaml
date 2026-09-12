@@ -1,0 +1,24 @@
+# Base LiteLLM config. Models are NOT listed here — dgxctl registers each
+# healthy vLLM deployment through the admin API at runtime, and LiteLLM
+# persists them in Postgres (STORE_MODEL_IN_DB=True).
+#
+# Add any models that live outside the cluster (hosted APIs) under model_list.
+model_list: []
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: true
+
+litellm_settings:
+  drop_params: true
+  # Retry once on another replica before failing the caller.
+  num_retries: 1
+  request_timeout: 600
+  telemetry: false
+
+router_settings:
+  routing_strategy: least-busy
+  # A replica that errors is parked briefly rather than kept in rotation.
+  allowed_fails: 3
+  cooldown_time: 30

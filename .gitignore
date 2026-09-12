@@ -1,0 +1,16 @@
+.venv/
+node_modules/
+backend/static/
+backend/*.db
+secrets/*
+!secrets/.gitkeep
+.env
+__pycache__/
+*.pyc
+frontend/tsconfig.tsbuildinfo
+
+# build + test scratch
+dist/
+*.log
+.pytest_cache/
+.ruff_cache/
