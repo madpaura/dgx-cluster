@@ -7,6 +7,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.api import fleet as fleet_module
 from app.main import app
+from app.services.deployments import drain_launches
 from tests.conftest import deploy_undersized, pump, register_fleet
 
 
@@ -101,6 +102,7 @@ async def test_a_failed_action_is_audited_as_failed(client):
     get_driver()._nodes["dgx-01"].unreachable = True
     await client.post("/api/deployments", json={
         "spec_key": "llama3.1-8b", "targets": [{"node_id": ids["dgx-01"], "gpu_indices": [0]}]})
+    await drain_launches()
     get_driver()._nodes["dgx-01"].unreachable = False
 
     failed = [e for e in (await client.get("/api/audit")).json() if not e["ok"]]

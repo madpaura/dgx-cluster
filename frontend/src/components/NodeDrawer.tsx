@@ -30,6 +30,7 @@ export function NodeDrawer({
   const [recon, setRecon] = useState<Reconcile | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [password, setPassword] = useState<string | null>(null);
   const toast = useToast();
 
   useEffect(() => {
@@ -77,6 +78,43 @@ export function NodeDrawer({
 
           <div className="body">
             {findings?.length ? <Findings items={findings} /> : null}
+
+            {/* The one node problem an operator can fix from here. */}
+            {/publickey|permission denied/i.test(node.last_error) && (
+              <section className="card mb">
+                <header><h3>Install dgxctl&rsquo;s key</h3></header>
+                <div className="body">
+                  <p className="hint mb">
+                    {node.name} is answering but will not accept our key. Give the SSH
+                    password once and it is appended to <code>authorized_keys</code>; it is
+                    not stored or logged.
+                  </p>
+                  <div className="row">
+                    <input
+                      type="password"
+                      placeholder="SSH password"
+                      value={password ?? ""}
+                      autoComplete="off"
+                      onChange={(e) => setPassword(e.target.value)}
+                    />
+                    <button
+                      className="btn primary"
+                      style={{ flex: "0 0 auto" }}
+                      disabled={busy || !password}
+                      onClick={async () => {
+                        await run(
+                          () => api.post(`/api/nodes/${nodeId}/authorize`, { password }),
+                          `${node.name} is under management`,
+                        );
+                        setPassword(null);
+                      }}
+                    >
+                      Install key
+                    </button>
+                  </div>
+                </div>
+              </section>
+            )}
 
             <div className="flex wrap mb">
               <button className="btn sm" disabled={busy} onClick={() => run(() => api.post(`/api/nodes/${nodeId}/probe`), "Probed")}>

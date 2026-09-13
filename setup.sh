@@ -63,6 +63,20 @@ ensure_env_var() {
 
 rand_hex() { openssl rand -hex 32 2>/dev/null || date +%s%N | sha256sum | cut -c1-64; }
 
+ensure_bind_sources() {
+    # docker compose bind-mounts these paths. A bind mount whose source does not
+    # exist makes Docker create a DIRECTORY there, owned by root — after which
+    # the key cannot be written and the driver reads a directory as a key. So
+    # they have to exist as files before compose is ever run.
+    mkdir -p secrets
+    if [ ! -f "$KEY_PATH" ]; then
+        ssh-keygen -t ed25519 -f "$KEY_PATH" -N '' -C 'dgxctl' >/dev/null 2>&1
+        chmod 600 "$KEY_PATH"
+        ok "Generated the fleet SSH key ($KEY_PATH)"
+    fi
+    [ -f secrets/known_hosts ] || : > secrets/known_hosts
+}
+
 ensure_runtime_env() {
     if [ ! -f .env ]; then
         cp .env.example .env
@@ -78,6 +92,7 @@ ensure_runtime_env() {
     ensure_env_var "LITELLM_PORT"        "4000"
     ensure_env_var "DGXCTL_DRIVER"       "sim"
     ensure_env_var "FLEET_SSH_KEY"       "$KEY_PATH"
+    ensure_bind_sources
 }
 
 # ── Key generation ───────────────────────────────────────────────

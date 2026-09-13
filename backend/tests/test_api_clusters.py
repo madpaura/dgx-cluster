@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from app.models import Role
+from app.services.deployments import drain_launches
 from tests.conftest import register_fleet, set_role
 
 

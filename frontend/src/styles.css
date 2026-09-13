@@ -422,6 +422,10 @@ b.dot {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .err-text { color: var(--err-ink); }
+.tile-note {
+  margin-top: 6px; font-size: 10.5px; color: var(--busy-ink); font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 /* ---------------------------------------------------------------- pills */
 .pill {

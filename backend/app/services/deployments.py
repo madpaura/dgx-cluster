@@ -181,8 +181,56 @@ async def create(
         gpu_memory_utilization=gpu_memory_utilization, extra_args=extra_args,
         image=image, team_id=team_id,
     )
-    await _launch(db, created, actor=actor)
+    # Launching is not done inline. The first deployment of a vLLM image on a
+    # node pulls several gigabytes, which no HTTP client will wait for; the
+    # claim is already committed, so the caller gets its deployments back
+    # immediately and watches them progress.
+    schedule_launch([d.id for d in created], actor=actor)
     return created
+
+
+_background: set[asyncio.Task] = set()
+
+
+async def drain_launches() -> None:
+    """Wait for every in-flight launch. For tests and for shutdown; nothing in
+    the request path should ever wait on a pull.
+
+    Only tasks belonging to the running loop can be awaited. Anything left over
+    from a loop that has since closed is already dead and is simply dropped —
+    awaiting it would raise rather than wait.
+    """
+    loop = asyncio.get_running_loop()
+    while True:
+        mine = [t for t in list(_background) if t.get_loop() is loop]
+        for task in list(_background):
+            if task.get_loop() is not loop:
+                _background.discard(task)
+        if not mine:
+            return
+        await asyncio.gather(*mine, return_exceptions=True)
+
+
+def schedule_launch(deployment_ids: list[str], *, actor: str) -> None:
+    """Start containers out of band, keeping a reference so the task is not
+    garbage collected mid-pull."""
+    task = asyncio.create_task(_launch_ids(deployment_ids, actor=actor))
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+async def _launch_ids(deployment_ids: list[str], *, actor: str) -> None:
+    from ..db import SessionLocal
+
+    for dep_id in deployment_ids:
+        try:
+            async with SessionLocal() as db:
+                dep = await db.get(Deployment, dep_id)
+                if dep is None or dep.status != DeployStatus.pending:
+                    continue
+                await _launch_one(db, dep, actor=actor)
+        except Exception:
+            log.exception("launching %s failed", dep_id)
 
 
 async def _reserve(
@@ -282,8 +330,8 @@ async def _reserve(
     return created
 
 
-async def _launch(db: AsyncSession, deployments: list[Deployment], *, actor: str) -> None:
-    """Start the containers for claims already written down.
+async def _launch_one(db: AsyncSession, dep: Deployment, *, actor: str) -> None:
+    """Make sure the image is on the node, then start the container.
 
     A claim whose container will not start is marked failed, which releases its
     GPUs — the reservation only outlives the attempt if the attempt succeeds.
@@ -292,10 +340,22 @@ async def _launch(db: AsyncSession, deployments: list[Deployment], *, actor: str
     env = {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}
     if settings.hf_token:
         env["HUGGING_FACE_HUB_TOKEN"] = settings.hf_token
+    args = list(dep.vllm_args.get("argv", []))
 
-    for dep in deployments:
-        args = list(dep.vllm_args.get("argv", []))
-        launch = LaunchSpec(
+    try:
+        if not await driver.image_present(dep.node, dep.image):
+            dep.status = DeployStatus.pulling
+            dep.status_reason = f"pulling {dep.image} — first use of this image on {dep.node.name}"
+            await db.commit()
+            events.publish("deployment", {"id": dep.id, "status": dep.status.value,
+                                          "reason": dep.status_reason})
+            await audit.emit(
+                db, severity="info", source="deployment", source_id=dep.id,
+                message=f"pulling {dep.image} onto {dep.node.name}",
+            )
+            await driver.pull_image(dep.node, dep.image)
+
+        dep.container_id = await driver.launch(dep.node, LaunchSpec(
             name=dep.container_name,
             image=dep.image,
             gpu_indices=[int(i) for i in dep.gpu_indices],
@@ -308,41 +368,37 @@ async def _launch(db: AsyncSession, deployments: list[Deployment], *, actor: str
                 "dgxctl.model": dep.served_model_name,
                 "dgxctl.owner": actor,
             },
+        ))
+        dep.status = DeployStatus.starting
+        dep.status_reason = "container started, loading weights"
+        await audit.record(
+            db, actor=actor, action="deployment.create", target_type="deployment",
+            target_id=dep.id,
+            summary=f"deploy {dep.served_model_name} to {dep.node.name} GPUs {dep.gpu_indices}",
+            detail={"argv": args, "image": dep.image, "port": dep.port},
         )
-        try:
-            dep.status = DeployStatus.pulling
-            dep.container_id = await driver.launch(dep.node, launch)
-            dep.status = DeployStatus.starting
-            dep.status_reason = "container started, loading weights"
-            await audit.record(
-                db, actor=actor, action="deployment.create", target_type="deployment",
-                target_id=dep.id,
-                summary=f"deploy {dep.served_model_name} to {dep.node.name} GPUs {dep.gpu_indices}",
-                detail={"argv": args, "image": dep.image, "port": dep.port},
-            )
-            await audit.emit(
-                db, severity="info", source="deployment", source_id=dep.id,
-                message=(f"{dep.served_model_name} starting on {dep.node.name} "
-                         f"GPU {','.join(str(i) for i in dep.gpu_indices)}"),
-            )
-        except Exception as exc:
-            dep.status = DeployStatus.failed
-            dep.status_reason = str(exc)[:1000]
-            await audit.record(
-                db, actor=actor, action="deployment.create", target_type="deployment",
-                target_id=dep.id,
-                summary=f"failed to start {dep.served_model_name} on {dep.node.name}",
-                detail={"error": str(exc)}, ok=False,
-            )
-            await audit.emit(
-                db, severity="error", source="deployment", source_id=dep.id,
-                message=(f"failed to start {dep.served_model_name} on {dep.node.name}: "
-                         f"{str(exc)[:200]}"),
-            )
+        await audit.emit(
+            db, severity="info", source="deployment", source_id=dep.id,
+            message=(f"{dep.served_model_name} starting on {dep.node.name} "
+                     f"GPU {','.join(str(i) for i in dep.gpu_indices)}"),
+        )
+    except Exception as exc:
+        dep.status = DeployStatus.failed
+        dep.status_reason = str(exc)[:1000]
+        await audit.record(
+            db, actor=actor, action="deployment.create", target_type="deployment",
+            target_id=dep.id,
+            summary=f"failed to start {dep.served_model_name} on {dep.node.name}",
+            detail={"error": str(exc)}, ok=False,
+        )
+        await audit.emit(
+            db, severity="error", source="deployment", source_id=dep.id,
+            message=(f"failed to start {dep.served_model_name} on {dep.node.name}: "
+                     f"{str(exc)[:200]}"),
+        )
 
     await db.commit()
-    for dep in deployments:
-        events.publish("deployment", {"id": dep.id, "status": dep.status.value})
+    events.publish("deployment", {"id": dep.id, "status": dep.status.value})
 
 
 async def stop(db: AsyncSession, dep: Deployment, *, actor: str, remove: bool = True) -> None:
@@ -406,7 +462,6 @@ async def restart(db: AsyncSession, dep: Deployment, *, actor: str) -> Deploymen
     node = await db.get(Node, node_id)
     async with allocation_lock():
         port = await allocate_port(db, node_id)
-    driver = get_driver()
     new = Deployment(
         id=str(uuid.uuid4()),
         served_model_name=name, spec_id=spec_id, hf_repo=repo, node_id=node_id, node=node,
@@ -417,30 +472,12 @@ async def restart(db: AsyncSession, dep: Deployment, *, actor: str) -> Deploymen
     db.add(new)
     await db.flush()
 
-    env = {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}
-    if settings.hf_token:
-        env["HUGGING_FACE_HUB_TOKEN"] = settings.hf_token
-    try:
-        new.container_id = await driver.launch(
-            node,
-            LaunchSpec(
-                name=new.container_name, image=image, gpu_indices=gpus, host_port=port, args=argv,
-                env=env, volumes={settings.hf_cache_dir: "/root/.cache/huggingface"},
-                labels={LABEL_KEY: new.id, "dgxctl.model": name, "dgxctl.owner": actor},
-            ),
-        )
-        new.status = DeployStatus.starting
-        new.status_reason = "restarted"
-    except Exception as exc:
-        new.status = DeployStatus.failed
-        new.status_reason = str(exc)[:1000]
-
     await audit.record(
         db, actor=actor, action="deployment.restart", target_type="deployment", target_id=new.id,
         summary=f"restart {name} on {node.name}", detail={"previous": dep.id},
-        ok=new.status != DeployStatus.failed,
     )
     await db.commit()
+    schedule_launch([new.id], actor=actor)
     events.publish("deployment", {"id": new.id, "status": new.status.value})
     return new
 

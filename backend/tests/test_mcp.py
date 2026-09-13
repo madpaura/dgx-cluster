@@ -15,6 +15,8 @@ from httpx import ASGITransport
 
 from app.main import app
 from app.mcp_server import AGENT_EMAIL, build_mcp_app, mcp
+from app.services.deployments import drain_launches
+from app.services.deployments import drain_launches
 from tests.conftest import deploy_undersized, pump, register_fleet
 
 HDRS = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
@@ -38,6 +40,9 @@ class Agent:
         self._id = 0
 
     async def rpc(self, method: str, params: dict | None = None) -> httpx.Response:
+        # Same reasoning as the HTTP test client: deploying returns before the
+        # container exists, and a tool called next should see the result.
+        await drain_launches()
         self._id += 1
         body = {"jsonrpc": "2.0", "id": self._id, "method": method}
         if params is not None:
@@ -297,7 +302,8 @@ async def test_stop_and_restart(agent, client):
     dep = (await agent.call("deploy_model", model="llama3.1-8b"))["deployments"][0]
 
     new = await agent.call("restart_deployment", deployment_id=dep["id"])
-    assert new["id"] != dep["id"] and new["status"] == "starting"
+    assert new["id"] != dep["id"]
+    assert (await agent.call("get_deployment", deployment_id=new["id"]))["status"] == "starting"
 
     stopped = await agent.call("stop_deployment", deployment_id=new["id"])
     assert stopped["status"] == "stopped"
@@ -338,6 +344,7 @@ async def test_reconcile_reports_a_vanished_container(agent, client):
 
     ids = await register_fleet(["dgx-01"])
     dep = (await agent.call("deploy_model", model="llama3.1-8b"))["deployments"][0]
+    await drain_launches()
     get_driver()._nodes["dgx-01"].containers.clear()
     r = await agent.call("reconcile_node", node_id=ids["dgx-01"])
     assert r["missing"] == [dep["id"]]

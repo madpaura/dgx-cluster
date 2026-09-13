@@ -35,9 +35,12 @@ from app.drivers.sim_driver import SimDriver  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Base, Cluster, Node, NodeKind, Role, User  # noqa: E402
 from app.services.catalog import seed as seed_catalog  # noqa: E402
+from app.services.deployments import drain_launches  # noqa: E402
 
-# Weights "load" instantly; the delay is realism we do not want in tests.
+# Weights "load" and images "pull" instantly; the delays are realism we do not
+# want in tests. The pull still happens, so the path is exercised.
 SimDriver.STARTUP_SECONDS = 0.0
+SimDriver.PULL_SECONDS = 0.0
 
 
 @pytest.fixture(scope="session")
@@ -54,7 +57,13 @@ async def db():
 @pytest.fixture(autouse=True)
 async def fresh_db():
     """Drop and rebuild the schema between tests, and reset the fake fleet so
-    containers from one test never leak into the next."""
+    containers from one test never leak into the next.
+
+    Draining first is load-bearing: a launch left running by the previous test
+    is still querying, and dropping its tables underneath it fails the next
+    test's setup rather than its own.
+    """
+    await drain_launches()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
@@ -64,12 +73,28 @@ async def fresh_db():
     async with SessionLocal() as session:
         await seed_catalog(session)
     yield
+    # Again on the way out, while this test's loop is still the running one.
+    await drain_launches()
+
+
+class SettlingClient(httpx.AsyncClient):
+    """Lets background launches finish before the next request.
+
+    Deploying returns as soon as the claim is committed; pulling an image and
+    starting the container happen out of band. Almost every test wants to
+    observe the result of that work, and a test that means to catch the
+    intermediate state reads the POST response, which this does not touch.
+    """
+
+    async def request(self, *args, **kwargs):
+        await drain_launches()
+        return await super().request(*args, **kwargs)
 
 
 @pytest.fixture
 async def client():
     transport = ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with SettlingClient(transport=transport, base_url="http://test") as c:
         yield c
 
 
@@ -151,6 +176,7 @@ async def deploy_undersized(client, node_id: str, gpu_indices: list[int]) -> dic
         "spec_key": "mis-sized",
         "targets": [{"node_id": node_id, "gpu_indices": gpu_indices}],
     })
+    await drain_launches()
     return r.json()[0]
 
 
@@ -163,6 +189,7 @@ async def pump(times: int = 1, gap: float = 0.0) -> None:
     """
     import asyncio
 
+    await drain_launches()      # containers must exist before we observe them
     for i in range(times):
         if i and gap:
             await asyncio.sleep(gap)

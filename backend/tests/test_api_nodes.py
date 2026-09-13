@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from app.models import Role
+from app.services.deployments import drain_launches
 from tests.conftest import pump, register_fleet, set_role
 
 
@@ -120,6 +121,7 @@ async def test_reconcile_catches_a_container_that_vanished(client):
 
     ids = await register_fleet(["dgx-01"])
     dep = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+    await drain_launches()
     get_driver()._nodes["dgx-01"].containers.clear()
 
     r = (await client.post(f"/api/nodes/{ids['dgx-01']}/reconcile")).json()

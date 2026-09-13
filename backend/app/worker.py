@@ -95,8 +95,8 @@ async def _reconcile_one(db: AsyncSession, dep: Deployment, container) -> None:
     driver = get_driver()
 
     if container is None:
-        if dep.status == DeployStatus.pending:
-            return  # launch still in flight
+        if dep.status in (DeployStatus.pending, DeployStatus.pulling):
+            return  # the launch has not created a container yet
         await _transition(db, dep, DeployStatus.failed, "container not present on node")
         return
 

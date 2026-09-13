@@ -38,9 +38,9 @@ export function clock(iso: string) {
   });
 }
 
-export const DEPLOY_TONE: Record<DeployStatus, "ok" | "warn" | "err" | "info" | "muted"> = {
+export const DEPLOY_TONE: Record<DeployStatus, "ok" | "warn" | "err" | "info" | "muted" | "busy"> = {
   pending: "info",
-  pulling: "info",
+  pulling: "busy",
   starting: "info",
   healthy: "ok",
   degraded: "warn",

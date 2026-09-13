@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 
 from app.models import Role
 from app.services import litellm as litellm_svc
+from app.services.deployments import drain_launches
 from tests.conftest import pump, register_fleet, set_role
 
 

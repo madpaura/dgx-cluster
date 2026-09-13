@@ -33,6 +33,7 @@ export function NodeTile({
   const models = [...new Set(live.map((d) => d.served_model_name))];
   const tps = live.reduce((a, d) => a + (d.last_metrics?.gen_tps ?? 0), 0);
   const degraded = live.filter((d) => d.status === "degraded").length;
+  const pulling = live.filter((d) => d.status === "pulling").length;
   // Old failures are history, not news — only surface fresh ones on the map.
   const failed = deployments.filter(
     (d) => d.status === "failed" && Date.now() - parseTs(d.created_at).getTime() < 3_600_000
@@ -117,6 +118,12 @@ export function NodeTile({
           </>
         )}
       </div>
+
+      {pulling > 0 && !offline && (
+        <div className="tile-note">
+          pulling image{pulling > 1 ? "s" : ""} — first use on this node
+        </div>
+      )}
 
       {(failed > 0 || degraded > 0 || hot) && !offline && (
         <div className="tile-warn">

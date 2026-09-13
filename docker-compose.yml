@@ -68,6 +68,9 @@ services:
     volumes:
       # The control server's SSH key. Must be in authorized_keys on every node.
       - ${FLEET_SSH_KEY:-./secrets/fleet_key}:/run/secrets/fleet_key:ro
+      # The public half too: installing the key on a new node means appending
+      # this to its authorized_keys, so the API has to be able to read it.
+      - ${FLEET_SSH_KEY:-./secrets/fleet_key}.pub:/run/secrets/fleet_key.pub:ro
       # Only read if DGXCTL_SSH_KNOWN_HOSTS above points here. Build it with
       # `ssh-keyscan -H <node> >> secrets/known_hosts` for every node; an empty
       # file at the default path is harmless while the feature is unused.

@@ -20,6 +20,11 @@ export function AddNodeDialog({
   const [clusterId, setClusterId] = useState(clusters[0]?.id ?? "");
   const [labels, setLabels] = useState("");
   const [busy, setBusy] = useState(false);
+  // A node that has never met dgxctl refuses its key. Rather than sending the
+  // operator away to run ssh-copy-id, ask for the password once and install it.
+  const [needsKey, setNeedsKey] = useState<Node | null>(null);
+  const [password, setPassword] = useState("");
+  const [keyError, setKeyError] = useState("");
   const toast = useToast();
 
   async function save() {
@@ -42,6 +47,10 @@ export function AddNodeDialog({
         cluster_id: clusterId || null,
         labels: parsed,
       });
+      if (node.status === "unreachable" && /publickey|permission denied/i.test(node.last_error)) {
+        setNeedsKey(node);
+        return;
+      }
       onAdded(node);
       onClose();
     } catch (e) {
@@ -49,6 +58,84 @@ export function AddNodeDialog({
     } finally {
       setBusy(false);
     }
+  }
+
+  async function authorize() {
+    if (!needsKey) return;
+    setBusy(true);
+    setKeyError("");
+    try {
+      const node = await api.post<Node>(`/api/nodes/${needsKey.id}/authorize`, { password });
+      setPassword("");
+      onAdded(node);
+      onClose();
+    } catch (e) {
+      setKeyError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (needsKey) {
+    return (
+      <Modal
+        title={`Authorize dgxctl on ${needsKey.name}`}
+        width={560}
+        onClose={() => {
+          setPassword("");
+          onAdded(needsKey);
+          onClose();
+        }}
+        footer={
+          <>
+            <button
+              className="btn"
+              onClick={() => {
+                setPassword("");
+                onAdded(needsKey);
+                onClose();
+              }}
+            >
+              Skip for now
+            </button>
+            <button className="btn primary" disabled={busy || !password} onClick={authorize}>
+              {busy ? "Installing…" : "Install key"}
+            </button>
+          </>
+        }
+      >
+        <p className="hint mb">
+          <strong>{needsKey.name}</strong> is reachable but refused our key — expected on a
+          machine dgxctl has not managed before. Give the password for{" "}
+          <code>{needsKey.ssh_port === 22 ? "" : `port ${needsKey.ssh_port}, `}</code>
+          the SSH user, and the control server's public key is appended to its{" "}
+          <code>authorized_keys</code> once. It is used for this and nothing else — not
+          stored, not logged.
+        </p>
+        <label className="f">
+          <span>SSH password</span>
+          <input
+            autoFocus
+            type="password"
+            value={password}
+            autoComplete="off"
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && password && authorize()}
+          />
+        </label>
+        {keyError && (
+          <div className="finding error">
+            <div className="t">Could not install the key</div>
+            <div className="d">{keyError}</div>
+          </div>
+        )}
+        <p className="hint">
+          Prefer not to? Skip, run{" "}
+          <code>ssh-copy-id -i secrets/fleet_key.pub {needsKey.hostname}</code> yourself,
+          then use Probe now on the node.
+        </p>
+      </Modal>
+    );
   }
 
   return (

@@ -9,6 +9,7 @@ Flip DGXCTL_DRIVER=ssh at the office and nothing above this layer changes.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import random
 import time
@@ -27,6 +28,13 @@ SIM_HARDWARE: dict[str, tuple[str, int, int, bool]] = {
     "rtx-ws-03": ("NVIDIA RTX 6000 Ada Generation", 4, 49140, False),
 }
 DEFAULT_HW = ("NVIDIA RTX 6000 Ada Generation", 2, 49140, False)
+
+# What a freshly racked node's password would be. Registering one of these
+# without bootstrapping it first fails the way real hardware does.
+SIM_NODE_PASSWORD = "dgx-bootstrap"
+
+# Nodes that have never had the control server's key installed.
+SIM_NEEDS_KEY = {"dgx-05"}
 
 
 @dataclass
@@ -58,10 +66,18 @@ class _Node:
     vram_mb: int
     unreachable: bool
     containers: dict[str, _Container] = field(default_factory=dict)
+    # Images already on the box. Empty to begin with, like a freshly installed
+    # node: the first deployment of any image has to pull it.
+    images: set[str] = field(default_factory=set)
+    # Whether the control server's key is installed. A node that has never been
+    # bootstrapped refuses key authentication, which is what an operator meets
+    # the first time they register real hardware.
+    key_installed: bool = True
 
 
 class SimDriver(NodeDriver):
-    STARTUP_SECONDS = 25.0  # pull + load weights + warm up
+    STARTUP_SECONDS = 25.0  # load weights + warm up, once the image is present
+    PULL_SECONDS = 6.0      # standing in for several gigabytes over the network
 
     @property
     def _fail_at(self) -> float:
@@ -78,7 +94,9 @@ class SimDriver(NodeDriver):
         key = node.name
         if key not in self._nodes:
             model, count, vram, down = SIM_HARDWARE.get(key, DEFAULT_HW)
-            self._nodes[key] = _Node(key, model, count, vram, down)
+            self._nodes[key] = _Node(
+                key, model, count, vram, down, key_installed=key not in SIM_NEEDS_KEY
+            )
         return self._nodes[key]
 
     # ---------------------------------------------------------------- probe
@@ -87,6 +105,12 @@ class SimDriver(NodeDriver):
         sim = self._node(node)
         if sim.unreachable:
             return NodeFacts(reachable=False, error="ssh: connect to host: No route to host (simulated)")
+        if not sim.key_installed:
+            return NodeFacts(
+                reachable=False,
+                error="Permission denied (publickey). The control server's key is not "
+                      "in authorized_keys on this node (simulated).",
+            )
 
         used = self._vram_used(sim)
         gpus = []
@@ -178,6 +202,29 @@ class SimDriver(NodeDriver):
             )
         sim.containers[spec.name] = c
         return cid
+
+    async def image_present(self, node, image: str) -> bool:
+        return image in self._node(node).images
+
+    async def pull_image(self, node, image: str) -> None:
+        sim = self._node(node)
+        if sim.unreachable:
+            raise RuntimeError("Cannot connect to the Docker daemon (simulated: node down)")
+        if "nonexistent" in image or image.endswith(":missing"):
+            raise RuntimeError(
+                f"Error response from daemon: manifest for {image} not found: "
+                f"manifest unknown (simulated)"
+            )
+        await asyncio.sleep(self.PULL_SECONDS)
+        sim.images.add(image)
+
+    async def install_authorized_key(self, node, password: str, public_key: str) -> None:
+        sim = self._node(node)
+        if sim.unreachable:
+            raise RuntimeError(f"could not reach {node.hostname}: No route to host (simulated)")
+        if password != SIM_NODE_PASSWORD:
+            raise RuntimeError("the password was not accepted")
+        sim.key_installed = True
 
     async def stop(self, node, name: str, remove: bool = True) -> None:
         sim = self._node(node)

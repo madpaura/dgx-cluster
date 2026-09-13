@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 
+from app.services.deployments import drain_launches
 from tests.conftest import register_fleet
 
 
@@ -135,7 +136,9 @@ async def test_a_container_that_fails_to_start_gives_its_gpus_back(client):
         r = await _deploy(client, spec_key="llama3.1-8b", replicas=1,
                           node_ids=[ids["rtx-ws-01"]])
         assert r.status_code == 201
-        assert r.json()[0]["status"] == "failed"
+        await drain_launches()
+        assert (await client.get(f"/api/deployments/{r.json()[0]['id']}")
+                ).json()["status"] == "failed"
     finally:
         get_driver()._nodes["rtx-ws-01"].unreachable = False
 

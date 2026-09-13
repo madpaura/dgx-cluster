@@ -114,6 +114,15 @@ class NodeCreate(BaseModel):
     labels: dict = {}
 
 
+class NodeAuthorize(BaseModel):
+    """A password used once to install the control server's key, then discarded.
+
+    Never stored, never logged, never written to the audit trail — what is
+    recorded is that a key was installed, by whom, and on which node.
+    """
+    password: str = Field(min_length=1, repr=False)
+
+
 class NodeUpdate(BaseModel):
     hostname: str | None = None
     ssh_port: int | None = None

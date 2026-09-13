@@ -81,6 +81,28 @@ class NodeDriver(ABC):
     async def logs(self, node, name: str, tail: int = 200) -> str: ...
 
     @abstractmethod
+    async def image_present(self, node, image: str) -> bool:
+        """Is this image already on the node?
+
+        Worth asking separately from pulling it: the first deployment of a given
+        vLLM image moves several gigabytes, and an operator watching a model sit
+        at "starting" deserves to know that is what is happening.
+        """
+
+    @abstractmethod
+    async def pull_image(self, node, image: str) -> None:
+        """Fetch an image, raising with the registry's own message on failure."""
+
+    async def install_authorized_key(self, node, password: str, public_key: str) -> None:
+        """Append the control server's public key to the node's authorized_keys,
+        authenticating with a password this once.
+
+        The password is used and discarded: it is never stored, logged, or put in
+        the audit trail. What is recorded is that a key was installed.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     async def http_get(self, node, port: int, path: str, timeout: float = 5.0) -> tuple[int, str]:
         """HTTP GET against a container port. Goes direct if the control server can
         reach the node's ports, which is the normal case on a private fleet."""

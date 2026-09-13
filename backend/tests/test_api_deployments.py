@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from app.drivers import get_driver
 from app.models import Role
+from app.services.deployments import drain_launches
 from tests.conftest import deploy_undersized, pump, register_fleet, set_role
 
 
@@ -63,6 +64,11 @@ async def test_deploy_launches_a_container_with_the_planned_arguments(client):
     await register_fleet(["dgx-01"])
     dep = (await client.post("/api/deployments", json={"spec_key": "qwen3-32b", "replicas": 1})).json()[0]
 
+    # The claim is committed before the container exists: pulling an image can
+    # take minutes and no HTTP client waits for it.
+    assert dep["status"] == "pending"
+    await drain_launches()
+    dep = (await client.get(f"/api/deployments/{dep['id']}")).json()
     assert dep["status"] == "starting"
     assert dep["gpu_indices"] == [0, 1]
     assert dep["tensor_parallel_size"] == 2
@@ -167,6 +173,7 @@ async def test_ports_are_allocated_without_collision(client):
 async def test_a_stopped_deployment_releases_its_port(client):
     await register_fleet(["dgx-01"])
     first = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+    await drain_launches()
     await client.post(f"/api/deployments/{first['id']}/stop")
     second = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
     assert second["port"] == first["port"]
@@ -208,6 +215,7 @@ async def test_series_accumulates_samples_for_charting(client):
 async def test_logs_come_back_with_the_shard_progress(client):
     await register_fleet(["dgx-01"])
     dep = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "replicas": 1})).json()[0]
+    await drain_launches()
     body = (await client.get(f"/api/deployments/{dep['id']}/logs")).json()
     assert "Loading safetensors checkpoint shards" in body["text"]
     assert "Uvicorn running" in body["text"]
@@ -283,12 +291,14 @@ async def test_stop_removes_the_container(client):
 async def test_restart_recreates_with_identical_arguments(client):
     await register_fleet(["dgx-01"])
     dep = (await client.post("/api/deployments", json={"spec_key": "qwen3-32b", "replicas": 1})).json()[0]
+    await drain_launches()
     new = (await client.post(f"/api/deployments/{dep['id']}/restart")).json()
+    await drain_launches()
 
     assert new["id"] != dep["id"]
     assert new["vllm_args"]["argv"] == dep["vllm_args"]["argv"]
     assert new["gpu_indices"] == dep["gpu_indices"]
-    assert new["status"] == "starting"
+    assert (await client.get(f"/api/deployments/{new['id']}")).json()["status"] == "starting"
     assert (await client.get(f"/api/deployments/{dep['id']}")).json()["status"] == "stopped"
 
 
@@ -341,3 +351,61 @@ async def test_unknown_deployment_is_a_404(client):
     assert (await client.get("/api/deployments/nope")).status_code == 404
     assert (await client.post("/api/deployments/nope/stop")).status_code == 404
     assert (await client.post("/api/deployments/nope/restart")).status_code == 404
+
+
+# ------------------------------------------------------------ image handling
+
+async def test_the_image_is_pulled_before_the_container_starts(client):
+    """A node that has never run this image has several gigabytes to fetch
+    first, and the operator should see that rather than an unexplained wait."""
+    from app.drivers import get_driver
+
+    await register_fleet(["dgx-01"])
+    sim = get_driver()._nodes["dgx-01"]
+    assert sim.images == set(), "a fresh node has no images"
+
+    dep = (await client.post("/api/deployments", json={"spec_key": "llama3.1-8b"})).json()[0]
+    await drain_launches()
+
+    assert "vllm/vllm-openai:latest" in sim.images
+    after = (await client.get(f"/api/deployments/{dep['id']}")).json()
+    assert after["status"] == "starting"
+
+
+async def test_pulling_is_announced_while_it_happens(client):
+    await register_fleet(["dgx-01"])
+    await client.post("/api/deployments", json={"spec_key": "llama3.1-8b"})
+    await drain_launches()
+
+    messages = [e["message"] for e in (await client.get("/api/events")).json()]
+    assert any("pulling vllm/vllm-openai:latest onto dgx-01" in m for m in messages)
+
+
+async def test_an_image_already_on_the_node_is_not_pulled_again(client):
+    await register_fleet(["dgx-01"])
+    await client.post("/api/deployments", json={"spec_key": "llama3.1-8b"})
+    await drain_launches()
+
+    before = len((await client.get("/api/events")).json())
+    await client.post("/api/deployments", json={
+        "spec_key": "llama3.1-8b", "served_model_name": "second"})
+    await drain_launches()
+
+    pulls = [e for e in (await client.get("/api/events")).json() if "pulling" in e["message"]]
+    assert len(pulls) == 1, "the second deployment reuses the image"
+    assert before  # the first deploy did log
+
+
+async def test_an_image_that_cannot_be_pulled_fails_with_the_registry_message(client):
+    """A typo in an image tag should read as a typo, not as a mystery."""
+    await register_fleet(["dgx-01"])
+    dep = (await client.post("/api/deployments", json={
+        "spec_key": "llama3.1-8b", "image": "vllm/vllm-openai:missing"})).json()[0]
+    await drain_launches()
+
+    after = (await client.get(f"/api/deployments/{dep['id']}")).json()
+    assert after["status"] == "failed"
+    assert "manifest" in after["status_reason"]
+
+    plan = (await client.post("/api/deployments/plan", json={"spec_key": "llama3.1-8b"})).json()
+    assert plan["placements"], "a failed pull must release the GPUs it claimed"

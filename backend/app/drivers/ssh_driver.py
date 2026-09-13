@@ -173,6 +173,57 @@ class SSHDriver(NodeDriver):
             raise RuntimeError(err.strip()[:500] or out.strip()[:500] or "docker run failed")
         return out.strip()[:64]
 
+    async def image_present(self, node, image: str) -> bool:
+        rc, _, _ = await self.run(node, f"docker image inspect {shlex.quote(image)} >/dev/null 2>&1", timeout=30)
+        return rc == 0
+
+    async def pull_image(self, node, image: str) -> None:
+        # Generous: a vLLM image is several gigabytes and the first pull on a
+        # node with a cold cache is the slowest thing dgxctl ever waits for.
+        rc, out, err = await self.run(node, f"docker pull {shlex.quote(image)}", timeout=3600)
+        if rc != 0:
+            raise RuntimeError((err.strip() or out.strip())[:500] or "docker pull failed")
+
+    async def install_authorized_key(self, node, password: str, public_key: str) -> None:
+        """One password-authenticated connection, purely to install the key.
+
+        Appended only if absent, so running this twice does not duplicate the
+        line; and the file is created with the permissions sshd insists on,
+        since it silently ignores a group-writable authorized_keys.
+        """
+        key = public_key.strip()
+        if not key.startswith(("ssh-", "ecdsa-", "sk-")):
+            raise RuntimeError("that does not look like an SSH public key")
+
+        script = (
+            "set -e; "
+            "mkdir -p ~/.ssh; chmod 700 ~/.ssh; "
+            "touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; "
+            f"grep -qxF {shlex.quote(key)} ~/.ssh/authorized_keys || "
+            f"printf '%s\n' {shlex.quote(key)} >> ~/.ssh/authorized_keys"
+        )
+        try:
+            async with asyncssh.connect(
+                node.hostname,
+                port=node.ssh_port,
+                username=node.ssh_user or settings.ssh_user,
+                password=password,
+                known_hosts=_host_key_policy(),
+            ) as conn:
+                result = await asyncio.wait_for(conn.run(script, check=False), timeout=30)
+        except asyncssh.PermissionDenied as exc:
+            raise RuntimeError("the password was not accepted") from exc
+        except (asyncssh.Error, OSError) as exc:
+            raise RuntimeError(f"could not reach {node.hostname}: {exc}") from exc
+
+        if (result.exit_status or 0) != 0:
+            raise RuntimeError((result.stderr or "").strip()[:300] or "could not write authorized_keys")
+
+        # Drop any cached connection so the next call proves the key works.
+        conn = self._conns.pop(node.id, None)
+        if conn is not None:
+            conn.close()
+
     async def stop(self, node, name: str, remove: bool = True) -> None:
         await self.run(node, f"docker stop -t 30 {shlex.quote(name)}", timeout=60)
         if remove:

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import audit
 from ..auth import current_user, require_admin
+from ..config import settings
 from ..db import get_db
+from ..drivers import get_driver
 from ..models import ACTIVE_STATUSES, Deployment, Node, NodeStatus, User
-from ..schemas import FindingOut, GpuTenant, NodeCreate, NodeOut, NodeUpdate
+from ..schemas import (
+    FindingOut, GpuTenant, NodeAuthorize, NodeCreate, NodeOut, NodeUpdate,
+)
 from ..services import diagnostics
 from ..services import nodes as node_svc
 
@@ -16,8 +22,15 @@ router = APIRouter(prefix="/api/nodes", tags=["nodes"])
 
 
 async def _load(db: AsyncSession, node_id: str) -> Node | None:
-    """Fetch a node with its relationships eagerly loaded."""
-    rows = await db.execute(select(Node).where(Node.id == node_id))
+    """Fetch a node with its relationships eagerly loaded.
+
+    populate_existing because this is called after probing, which inserts GPU
+    rows: without it the session hands back the instance it already holds, whose
+    collections were loaded before those rows existed.
+    """
+    rows = await db.execute(
+        select(Node).where(Node.id == node_id).execution_options(populate_existing=True)
+    )
     return rows.scalars().unique().one_or_none()
 
 
@@ -154,6 +167,64 @@ async def reconcile_node(node_id: str, db: AsyncSession = Depends(get_db), _: Us
     if not node:
         raise HTTPException(404, "node not found")
     return await node_svc.adopt_and_prune(db, node)
+
+
+@router.post("/{node_id}/authorize", response_model=NodeOut)
+async def authorize_node(
+    node_id: str,
+    body: NodeAuthorize,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """Install the control server's public key on a node, using a password once.
+
+    A node that has never met dgxctl refuses key authentication, which is what
+    an operator hits the first time they rack hardware. Rather than asking them
+    to go and run ssh-copy-id, this does it — once — and then never needs the
+    password again.
+    """
+    node = await db.get(Node, node_id)
+    if not node:
+        raise HTTPException(404, "node not found")
+
+    public_key_path = f"{settings.ssh_key_path}.pub"
+    try:
+        public_key = Path(public_key_path).read_text().strip()
+    except OSError as exc:
+        raise HTTPException(
+            500,
+            f"cannot read the control server's public key at {public_key_path}. "
+            f"Generate the pair with ./setup.sh keygen.",
+        ) from exc
+
+    try:
+        await get_driver().install_authorized_key(node, body.password, public_key)
+    except NotImplementedError as exc:
+        raise HTTPException(400, "this driver cannot install keys") from exc
+    except Exception as exc:
+        await audit.record(
+            db, actor=user.email, action="node.authorize", target_type="node", target_id=node.id,
+            summary=f"could not install a key on {node.name}", detail={"error": str(exc)[:300]},
+            ok=False,
+        )
+        await db.commit()
+        raise HTTPException(400, str(exc)) from exc
+
+    await audit.record(
+        db, actor=user.email, action="node.authorize", target_type="node", target_id=node.id,
+        summary=f"installed the control server's key on {node.name}",
+    )
+    await node_svc.refresh(db, node)     # prove the key works before answering
+    await db.commit()
+
+    loaded = await _load(db, node.id)
+    if loaded.status == NodeStatus.unreachable:
+        raise HTTPException(
+            502,
+            f"the key was installed but {node.name} still will not accept it: "
+            f"{loaded.last_error[:200]}",
+        )
+    return to_out(loaded)
 
 
 @router.get("/{node_id}/diagnostics", response_model=list[FindingOut])
