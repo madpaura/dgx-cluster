@@ -7,17 +7,19 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth import current_user, require_deployer
+from ..config import settings
 from ..db import get_db
 from ..models import (
     ACTIVE_STATUSES, Deployment, DeployStatus, MetricSample, ModelSpec, Node, Role, Team, User,
 )
 from ..schemas import (
-    BulkAction, DeploymentOut, DeployRequest, FindingOut, LogsOut, PlacementOut, PlanOut,
-    RejectionOut, SeriesOut, SeriesPoint,
+    BulkAction, CheckOut, DeploymentOut, DeployRequest, EstimateOut, FindingOut, LogsOut,
+    PlacementOut, PlanOut, RejectionOut, SeriesOut, SeriesPoint,
 )
 from ..services import deployments as deploy_svc
 from ..services import diagnostics
-from ..services.capacity import node_capacity
+from ..services import sizing
+from ..services.capacity import node_capacity_now
 from ..services.placement import plan as plan_placements
 
 router = APIRouter(prefix="/api/deployments", tags=["deployments"])
@@ -85,6 +87,36 @@ async def list_deployments(
     return [to_out(d) for d in rows.scalars().unique()]
 
 
+async def _assess(db: AsyncSession, body: DeployRequest, spec, hf_repo: str, tp: int,
+                  max_len: int, nodes, placements) -> sizing.Assessment:
+    """Size the model and check the settings against what it declares.
+
+    Done against the node it would actually land on, because two of the checks —
+    FP8 needing Hopper, and having enough GPUs for the tensor-parallel size —
+    depend on the hardware rather than the model.
+    """
+    gpu_model, gpus_available = "", 0
+    if placements:
+        node = next((n for n in nodes if n.id == placements[0].node_id), None)
+        if node and node.gpus:
+            gpu_model = node.gpus[0].name
+            gpus_available = len(node.gpus)
+
+    extra = {**(spec.extra_args if spec else {}), **body.extra_args}
+    return await sizing.assess(
+        hf_repo=hf_repo,
+        tensor_parallel=tp,
+        max_model_len=max_len,
+        max_num_seqs=int(extra.get("--max-num-seqs", extra.get("max-num-seqs", 256))),
+        quantization=body.quantization or (spec.quantization if spec else ""),
+        revision=spec.revision if spec else "",
+        catalog_gb=(spec.min_gpu_memory_gb if spec else 0.0),
+        hf_token=settings.hf_token,
+        gpu_model=gpu_model,
+        gpus_available=gpus_available,
+    )
+
+
 @router.post("/plan", response_model=PlanOut)
 async def plan_deployment(
     body: DeployRequest, db: AsyncSession = Depends(get_db), _: User = Depends(current_user)
@@ -121,7 +153,12 @@ async def plan_deployment(
         revision=spec.revision if spec else "",
         extra_args={**(spec.extra_args if spec else {}), **body.extra_args},
     )
+    assessment = await _assess(db, body, spec, hf_repo, tp, max_len, nodes, placements)
+
     return PlanOut(
+        estimate=EstimateOut(**assessment.estimate.__dict__),
+        checks=[CheckOut(**c.__dict__) for c in assessment.checks],
+        blocked=bool(assessment.blocking),
         placements=[
             PlacementOut(
                 node_id=p.node_id, node_name=p.node_name, gpu_indices=p.gpu_indices,
@@ -156,6 +193,20 @@ async def create_deployment(
     # under the lock and refuses, which is what prevents double-booking; here we
     # simply look again. Someone who named exact GPUs gets the refusal instead —
     # re-placing would put their model somewhere they did not ask for.
+    # Judge the settings before anything is claimed or downloaded. A context
+    # length the model does not have, or a tensor-parallel size that does not
+    # divide its heads, is a container that dies several minutes into pulling
+    # weights — knowable now, from what the model declares about itself.
+    rows = await db.execute(select(Node).order_by(Node.name))
+    candidates = list(rows.scalars().unique())
+    if body.node_ids:
+        candidates = [n for n in candidates if n.id in set(body.node_ids)]
+    preview, _ = plan_placements(candidates, per_gpu_gb=per_gpu_gb, tp=tp)
+    assessment = await _assess(db, body, spec, hf_repo, tp, max_len, candidates, preview)
+    if assessment.blocking:
+        first = assessment.blocking[0]
+        raise HTTPException(422, f"{first.title}: {first.detail} {first.fix}")
+
     # Read off the ORM object once. Rolling back a lost race expires every
     # instance in the session, and touching an expired attribute afterwards is
     # a refresh — IO the async session cannot perform mid-request.
@@ -205,7 +256,7 @@ async def _check_free(db: AsyncSession, targets: list[deploy_svc.Target], per_gp
         if unknown:
             raise HTTPException(400, f"{node.name} has no GPU {unknown}")
 
-        capacity = node_capacity(node)
+        capacity = await node_capacity_now(db, node)
         short = {i: capacity.get(i, 0) for i in t.gpu_indices if capacity.get(i, 0) < need_mb}
         if short:
             detail = ", ".join(

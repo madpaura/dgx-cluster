@@ -23,7 +23,7 @@ from ..config import settings
 from ..drivers import LaunchSpec, get_driver
 from ..models import ACTIVE_STATUSES, Deployment, DeployStatus, ModelSpec, Node, NodeStatus
 from . import litellm as litellm_svc
-from .capacity import node_capacity
+from .capacity import node_capacity_now
 from .placement import Placement, plan
 
 log = logging.getLogger(__name__)
@@ -221,7 +221,7 @@ async def _reserve(
                 raise DeployError(f"{node.name} is {node.status.value}; not accepting deployments")
 
             reserve_mb = int(round(per_gpu_gb * 1024))
-            capacity = node_capacity(node)
+            capacity = await node_capacity_now(db, node)
             short = {
                 i: capacity.get(i, 0) for i in target.gpu_indices
                 if capacity.get(i, 0) < reserve_mb

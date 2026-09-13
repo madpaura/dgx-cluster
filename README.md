@@ -30,9 +30,22 @@ the top of their cluster.
 Clusters are labels, not fences — create, rename, move nodes across and delete
 freely. Deleting one releases its nodes to *Unassigned*; nothing stops.
 
-**Deploy** — pick a model, and before anything starts you see which nodes can
-host it, **why each other node cannot**, and the exact `docker run` that will
-execute. Deploy to one GPU, a tensor-parallel group, or several nodes at once.
+**Deploy** — pick a model, and before anything starts you see what it will
+need, which nodes can host it, **why each other node cannot**, and the exact
+`docker run` that will execute.
+
+The size is read from the model's own `config.json`, not guessed from its name:
+parameter count from the architecture, KV cache from the layer and KV-head
+shape at your context length. Settings vLLM would reject — a context longer
+than the model supports, a tensor-parallel size that does not divide its
+attention heads, FP8 on a pre-Hopper card, a quantization that contradicts the
+checkpoint — are refused up front rather than discovered by a container dying
+several minutes into a weight download.
+
+**GPUs are pools, not slots.** Several models share a card as long as their
+reservations fit, and each is told the matching `--gpu-memory-utilization`, so
+an 8B model no longer occupies a whole 80 GB H100. Placement packs onto
+partly-used cards first, keeping whole GPUs free for models that need them.
 
 **Diagnose** — when a deployment fails, you get a plain-English cause and a fix,
 not a 4000-line traceback. CUDA OOM, gated Hugging Face repos, NCCL transport

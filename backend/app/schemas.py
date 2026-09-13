@@ -222,12 +222,36 @@ class RejectionOut(BaseModel):
     reason: str
 
 
+class EstimateOut(BaseModel):
+    total_gb_per_gpu: float
+    weights_gb: float
+    kv_cache_gb: float
+    overhead_gb: float
+    minimum_gb_per_gpu: float
+    concurrent_sequences: int
+    tensor_parallel: int
+    max_model_len: int
+    params_b: float
+    source: str
+    detail: str
+
+
+class CheckOut(BaseModel):
+    severity: str
+    title: str
+    detail: str
+    fix: str
+
+
 class PlanOut(BaseModel):
     placements: list[PlacementOut]
     rejections: list[RejectionOut]
     per_gpu_gb: float
     tensor_parallel_size: int
     argv: list[str]
+    estimate: EstimateOut | None = None
+    checks: list[CheckOut] = []
+    blocked: bool = False
 
 
 class FindingOut(BaseModel):
