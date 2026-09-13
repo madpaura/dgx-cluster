@@ -94,7 +94,10 @@ export function DeployDialog({
   }, [body, specKey, usingCustom, customRepo]);
 
   const canDeploy =
-    !busy && !!(usingCustom ? customRepo.trim() : specKey) && (plan?.placements.length ?? 0) > 0;
+    !busy &&
+    !!(usingCustom ? customRepo.trim() : specKey) &&
+    (plan?.placements.length ?? 0) > 0 &&
+    !plan?.blocked;
 
   async function deploy() {
     setBusy(true);
@@ -129,7 +132,12 @@ export function DeployDialog({
           <button className="btn" onClick={onClose}>
             Cancel
           </button>
-          <button className="btn primary" disabled={!canDeploy} onClick={deploy}>
+          <button
+            className="btn primary"
+            disabled={!canDeploy}
+            title={plan?.blocked ? "These settings cannot work — see above" : undefined}
+            onClick={deploy}
+          >
             {busy ? "Starting…" : "Deploy"}
           </button>
         </>
@@ -208,6 +216,44 @@ export function DeployDialog({
         </label>
       </div>
 
+      {/* What it will need, before anything is claimed or downloaded. */}
+      {plan?.estimate && (
+        <section className="card mb">
+          <header>
+            <h3>What it needs</h3>
+            <span className="hint right">
+              {plan.estimate.source === "model config"
+                ? "measured from the model's config"
+                : plan.estimate.source === "catalog"
+                  ? "from your catalog entry"
+                  : "estimated from the repo name"}
+            </span>
+          </header>
+          <div className="body">
+            <div className="sizebar" aria-hidden>
+              <i className="w" style={{ flexGrow: plan.estimate.weights_gb }} />
+              <i className="k" style={{ flexGrow: plan.estimate.kv_cache_gb }} />
+              <i className="o" style={{ flexGrow: plan.estimate.overhead_gb }} />
+            </div>
+            <div className="flex wrap mt" style={{ gap: 16, fontSize: 12.5 }}>
+              <span><b className="dot w" /> weights {plan.estimate.weights_gb} GB</span>
+              <span><b className="dot k" /> KV cache {plan.estimate.kv_cache_gb} GB</span>
+              <span><b className="dot o" /> overhead {plan.estimate.overhead_gb} GB</span>
+              <strong className="right">{plan.estimate.total_gb_per_gpu} GB per GPU</strong>
+            </div>
+            <p className="hint mt">{plan.estimate.detail}</p>
+          </div>
+        </section>
+      )}
+
+      {plan?.checks.map((c) => (
+        <div key={c.title} className={`finding ${c.severity}`}>
+          <div className="t">{c.title}</div>
+          <div className="d">{c.detail}</div>
+          <div className="fix"><b>Fix →</b> {c.fix}</div>
+        </div>
+      ))}
+
       {/* ---------------------------------------------------- plan preview */}
       <section className="card mb">
         <header>
@@ -247,7 +293,9 @@ export function DeployDialog({
                       </td>
                       <td className="mono sub">GPU {p.gpu_indices.join(",")}</td>
                       <td className="sub">{p.gpu_model.replace("NVIDIA ", "")}</td>
-                      <td className="num sub">{p.free_gb_per_gpu} GB free</td>
+                      <td className="num sub">
+                        {p.reserve_gb_per_gpu} of {p.free_gb_per_gpu} GB free
+                      </td>
                       <td className="sub">{p.note}</td>
                     </tr>
                   ))}

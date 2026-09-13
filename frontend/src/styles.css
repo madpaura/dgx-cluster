@@ -377,11 +377,34 @@ html[data-theme="crextio"] .stat .v { font-weight: 500; font-size: 32px; }
   margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
-/* One segment per GPU. */
+/* One segment per GPU, filled in proportion to the VRAM reserved on it. */
 .slots { display: flex; gap: 3px; margin: 9px 0 7px; height: 6px; }
-.slots i { flex: 1; min-width: 2px; border-radius: 3px; }
-.slots i.off { background: var(--line); }
-.slots i.on { background: var(--accent); }
+.slots i {
+  flex: 1; min-width: 2px; border-radius: 3px; overflow: hidden;
+  background: var(--line); display: block;
+}
+.slots i b { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+.slots i.off b { background: transparent; }
+
+/* Stale data has to look different from a quiet fleet. */
+.stale {
+  margin: 0 4px 14px; padding: 11px 16px; border-radius: var(--radius-s);
+  background: color-mix(in srgb, var(--warn) 14%, var(--card));
+  border: 1px solid color-mix(in srgb, var(--warn) 34%, var(--card));
+  color: var(--warn-ink); font-size: 13px;
+}
+.stale strong { color: var(--warn-ink); }
+
+/* Where a model's memory goes. */
+.sizebar { display: flex; height: 12px; border-radius: 6px; overflow: hidden; background: var(--line); }
+.sizebar i { display: block; }
+.sizebar i.w, .dot.w { background: var(--accent); }
+.sizebar i.k, .dot.k { background: var(--accent-2); }
+.sizebar i.o, .dot.o { background: var(--line-2); }
+b.dot {
+  display: inline-block; width: 9px; height: 9px; border-radius: 3px;
+  margin-right: 5px; vertical-align: baseline;
+}
 
 /* Pinned to the bottom so feet line up across a row of fixed-height tiles.
    Never wraps: the VRAM figure on the right truncates before the counts do. */

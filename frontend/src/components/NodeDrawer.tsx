@@ -175,6 +175,7 @@ export function NodeDrawer({
                   <tr>
                     <th>#</th>
                     <th>Serving</th>
+                    <th style={{ textAlign: "right" }}>Reserved</th>
                     <th style={{ textAlign: "right" }}>Util</th>
                     <th style={{ textAlign: "right" }}>VRAM</th>
                     <th style={{ textAlign: "right" }}>Temp</th>
@@ -185,11 +186,33 @@ export function NodeDrawer({
                   {node.gpus.map((g) => (
                     <tr
                       key={g.index}
-                      className={g.deployment_id ? "clickable" : ""}
-                      onClick={() => g.deployment_id && onOpenDeployment(g.deployment_id)}
+                      className={g.tenants.length ? "clickable" : ""}
+                      onClick={() => g.tenants[0] && onOpenDeployment(g.tenants[0].deployment_id)}
                     >
                       <td className="mono">{g.index}</td>
-                      <td>{g.model_name ?? <span className="muted">free</span>}</td>
+                      <td>
+                        {g.tenants.length === 0 ? (
+                          <span className="muted">free</span>
+                        ) : (
+                          <div className="flex wrap" style={{ gap: 5 }}>
+                            {g.tenants.map((t) => (
+                              <button
+                                key={t.deployment_id}
+                                className="btn ghost sm"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onOpenDeployment(t.deployment_id);
+                                }}
+                              >
+                                {t.model_name}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </td>
+                      <td className="num">
+                        {g.reserved_mb ? `${fmtGb(g.reserved_mb, 0)}B` : "–"}
+                      </td>
                       <td className="num">{g.utilization.toFixed(0)}%</td>
                       <td className="num">
                         {fmtGb(g.memory_used_mb, 1)}/{fmtGb(g.memory_total_mb)}B

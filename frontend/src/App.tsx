@@ -1,6 +1,7 @@
+import { useEffect, useState } from "react";
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 import { ThemeSwitcher } from "./components/ThemeSwitcher";
-import { useLiveEvents, usePolled } from "./lib/api";
+import { useLiveEvents, usePolled, useStaleSince } from "./lib/api";
 import { fmtNum } from "./lib/format";
 import type { Me, RuntimeConfig, Summary } from "./types";
 import { Activity } from "./pages/Activity";
@@ -75,6 +76,27 @@ function Strip({ s }: { s: Summary | null }) {
   );
 }
 
+function StaleBanner() {
+  const since = useStaleSince();
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (since === null) return;
+    const id = window.setInterval(() => tick((n) => n + 1), 5000);
+    return () => window.clearInterval(id);
+  }, [since]);
+  if (since === null) return null;
+
+  const seconds = Math.round((Date.now() - since) / 1000);
+  const howLong = seconds < 90 ? `${seconds}s` : `${Math.round(seconds / 60)} min`;
+  return (
+    <div className="stale" role="status">
+      <strong>Not reaching dgxctl.</strong> Everything below is from {howLong} ago and is
+      no longer updating — the fleet itself is unaffected, but this page cannot tell you
+      what it is doing.
+    </div>
+  );
+}
+
 export default function App() {
   const { data: me } = usePolled<Me>("/api/auth/me", 120000);
   const { data: cfg } = usePolled<RuntimeConfig>("/api/config", 120000);
@@ -119,6 +141,7 @@ export default function App() {
 
       <main className="main">
         <div className="page">
+          <StaleBanner />
           <section className="card headline">
             <h1 className="hello">
               Welcome in{me?.name ? `, ${me.name.split(" ")[0]}` : ""}

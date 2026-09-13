@@ -23,8 +23,9 @@ export function NodeTile({
   onDragStart: (e: React.DragEvent) => void;
 }) {
   const offline = node.status === "unreachable";
-  const busy = node.gpus.filter((g) => g.deployment_id).length;
+  const busy = node.gpus.filter((g) => g.tenants.length).length;
   const total = node.gpus.length;
+  const sharing = node.gpus.some((g) => g.tenants.length > 1);
   const usedMb = node.gpus.reduce((a, g) => a + g.memory_used_mb, 0);
   const totalMb = node.gpus.reduce((a, g) => a + g.memory_total_mb, 0);
   const gpuName = node.gpus[0]?.name.replace("NVIDIA ", "").replace(" Generation", "") ?? "";
@@ -69,20 +70,26 @@ export function NodeTile({
 
       <div className="tile-hw">{total ? `${total}× ${gpuName}` : node.hostname}</div>
 
-      {/* One segment per GPU. Not a grid of tiles — a single occupancy bar that
-          still shows which slots are taken. */}
+      {/* One segment per GPU, filled in proportion to the VRAM claimed on it.
+          A card holding two models reads as fuller than one holding a small
+          model, which is the distinction that matters now that cards are
+          shared. */}
       <div className="slots" aria-label={`${busy} of ${total} GPUs in use`}>
-        {node.gpus.map((g) => (
-          <i
-            key={g.index}
-            className={g.deployment_id ? "on" : "off"}
-            style={
-              g.deployment_id
-                ? { opacity: 0.45 + Math.min(1, g.utilization / 100) * 0.55 }
-                : undefined
-            }
-          />
-        ))}
+        {node.gpus.map((g) => {
+          const claimed = g.memory_total_mb
+            ? Math.min(100, (g.reserved_mb / g.memory_total_mb) * 100)
+            : 0;
+          return (
+            <i key={g.index} className={g.tenants.length ? "on" : "off"}
+               title={
+                 g.tenants.length
+                   ? `GPU ${g.index}: ${g.tenants.map((t) => t.model_name).join(", ")}`
+                   : `GPU ${g.index}: free`
+               }>
+              <b style={{ width: `${claimed}%` }} />
+            </i>
+          );
+        })}
         {total === 0 && <i className="off" style={{ flex: 1 }} />}
       </div>
 
@@ -91,8 +98,8 @@ export function NodeTile({
           <span className="err-text">{node.last_error?.slice(0, 44) || "unreachable"}</span>
         ) : (
           <>
-            <span>
-              {busy}/{total} GPUs
+            <span title={sharing ? "some GPUs hold more than one model" : undefined}>
+              {busy}/{total} GPUs{sharing ? " ·shared" : ""}
             </span>
             <span className="dot-sep">·</span>
             <span>

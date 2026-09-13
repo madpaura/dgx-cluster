@@ -59,6 +59,12 @@ class NodeMove(BaseModel):
 
 # ---------------------------------------------------------------------- nodes
 
+class GpuTenant(BaseModel):
+    deployment_id: str
+    model_name: str
+    reserved_mb: int
+
+
 class GpuOut(ORM):
     id: str
     index: int
@@ -72,8 +78,10 @@ class GpuOut(ORM):
     ecc_errors: int
     updated_at: datetime | None = None
     # filled by the API layer
-    deployment_id: str | None = None
+    deployment_id: str | None = None      # the first tenant, for one-line summaries
     model_name: str | None = None
+    tenants: list[GpuTenant] = []
+    reserved_mb: int = 0
 
 
 class NodeOut(ORM):

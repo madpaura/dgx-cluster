@@ -8,7 +8,7 @@ from .. import audit
 from ..auth import current_user, require_admin
 from ..db import get_db
 from ..models import ACTIVE_STATUSES, Deployment, Node, NodeStatus, User
-from ..schemas import FindingOut, NodeCreate, NodeOut, NodeUpdate
+from ..schemas import FindingOut, GpuTenant, NodeCreate, NodeOut, NodeUpdate
 from ..services import diagnostics
 from ..services import nodes as node_svc
 
@@ -22,17 +22,30 @@ async def _load(db: AsyncSession, node_id: str) -> Node | None:
 
 
 def to_out(node: Node) -> NodeOut:
-    """Attach 'which deployment owns this GPU' so the fleet view needs one call."""
-    owner: dict[int, tuple[str, str]] = {}
+    """Attach what is running on each GPU so the fleet view needs one call.
+
+    Plural: a GPU holds as many models as its VRAM allows. deployment_id and
+    model_name name the first of them, which is what a single-line summary can
+    show; tenants carries the rest.
+    """
+    residents: dict[int, list] = {}
     for d in node.deployments:
         if d.status in ACTIVE_STATUSES:
             for i in d.gpu_indices:
-                owner[int(i)] = (d.id, d.served_model_name)
+                residents.setdefault(int(i), []).append(d)
+
     out = NodeOut.model_validate(node)
     out.cluster_name = node.cluster.name if node.cluster else ""
     for gpu in out.gpus:
-        if gpu.index in owner:
-            gpu.deployment_id, gpu.model_name = owner[gpu.index]
+        here = residents.get(gpu.index, [])
+        gpu.tenants = [
+            GpuTenant(deployment_id=d.id, model_name=d.served_model_name,
+                      reserved_mb=int(d.reserved_mb_per_gpu or 0))
+            for d in here
+        ]
+        gpu.reserved_mb = sum(t.reserved_mb for t in gpu.tenants)
+        if here:
+            gpu.deployment_id, gpu.model_name = here[0].id, here[0].served_model_name
     return out
 
 

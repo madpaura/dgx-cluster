@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     litellm_base_url: str = "http://litellm:4000"
     litellm_master_key: str = "sk-dgxctl-master"
     litellm_auto_register: bool = True
+    # Where a BROWSER can reach the proxy. litellm_base_url is how the control
+    # server reaches it, which inside Docker is a name only other containers
+    # resolve — following that link from a laptop goes nowhere.
+    litellm_public_url: str = ""
 
     # --- auth ---
     # "dev" bypasses OIDC and logs everyone in as admin. Use only locally.

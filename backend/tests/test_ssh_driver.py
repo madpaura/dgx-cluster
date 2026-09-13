@@ -268,3 +268,54 @@ async def test_the_ssh_user_falls_back_to_the_server_default():
 
     assert (Blank.ssh_user or settings.ssh_user) == settings.ssh_user
     assert settings.ssh_user
+
+
+# ------------------------------------------------------- host key verification
+
+def test_host_keys_are_verified_when_a_known_hosts_file_is_configured(monkeypatch):
+    """Without verification, anything answering on a node's address is trusted
+    with the command that launches containers on it."""
+    from app.config import settings
+    from app.drivers import ssh_driver
+
+    monkeypatch.setattr(settings, "ssh_known_hosts", "/etc/dgxctl/known_hosts")
+    assert ssh_driver._host_key_policy() == "/etc/dgxctl/known_hosts"
+
+
+def test_an_unset_known_hosts_file_skips_verification(monkeypatch):
+    from app.config import settings
+    from app.drivers import ssh_driver
+
+    monkeypatch.setattr(settings, "ssh_known_hosts", "")
+    assert ssh_driver._host_key_policy() is None
+
+
+def test_skipping_verification_is_announced_exactly_once(monkeypatch):
+    """A warning at the poll interval would bury the log it is meant to stand
+    out in, so the flag is what carries the once-only guarantee."""
+    from app.config import settings
+    from app.drivers import ssh_driver
+
+    monkeypatch.setattr(settings, "ssh_known_hosts", "")
+    monkeypatch.setattr(ssh_driver._host_key_policy, "_warned", False, raising=False)
+
+    warnings: list[str] = []
+    monkeypatch.setattr(ssh_driver.log, "warning", lambda msg, *a: warnings.append(msg))
+
+    for _ in range(5):
+        ssh_driver._host_key_policy()
+    assert len(warnings) == 1
+    assert "not being verified" in warnings[0]
+
+
+def test_configuring_a_file_stops_the_warning_entirely(monkeypatch):
+    from app.config import settings
+    from app.drivers import ssh_driver
+
+    monkeypatch.setattr(settings, "ssh_known_hosts", "/etc/dgxctl/known_hosts")
+    monkeypatch.setattr(ssh_driver._host_key_policy, "_warned", False, raising=False)
+    warnings: list[str] = []
+    monkeypatch.setattr(ssh_driver.log, "warning", lambda msg, *a: warnings.append(msg))
+
+    ssh_driver._host_key_policy()
+    assert warnings == []

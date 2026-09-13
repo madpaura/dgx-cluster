@@ -37,6 +37,30 @@ export const api = {
 
 /** Poll an endpoint, and re-fetch immediately whenever the websocket says
  *  something changed. Keeps the UI live without a state-sync framework. */
+/** Set whenever any poll fails, cleared when one succeeds. The dashboard shows
+ *  live numbers; when they stop being live that has to be visible, or a frozen
+ *  screen reads as a healthy fleet. */
+const staleListeners = new Set<(since: number | null) => void>();
+let firstFailureAt: number | null = null;
+
+function reportPoll(ok: boolean) {
+  const was = firstFailureAt;
+  if (ok) firstFailureAt = null;
+  else if (firstFailureAt === null) firstFailureAt = Date.now();
+  if (was !== firstFailureAt) staleListeners.forEach((fn) => fn(firstFailureAt));
+}
+
+export function useStaleSince(): number | null {
+  const [since, setSince] = useState<number | null>(firstFailureAt);
+  useEffect(() => {
+    staleListeners.add(setSince);
+    return () => {
+      staleListeners.delete(setSince);
+    };
+  }, []);
+  return since;
+}
+
 export function usePolled<T>(path: string, intervalMs = 5000, deps: unknown[] = []) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -46,11 +70,14 @@ export function usePolled<T>(path: string, intervalMs = 5000, deps: unknown[] = 
   const refresh = useCallback(async () => {
     try {
       const value = await api.get<T>(path);
+      reportPoll(true);
       if (alive.current) {
         setData(value);
         setError(null);
       }
     } catch (e) {
+      // A 4xx is an answer; only a failure to reach the server is staleness.
+      reportPoll(e instanceof ApiError && e.status > 0 ? true : false);
       if (alive.current) setError((e as Error).message);
     } finally {
       if (alive.current) setLoading(false);

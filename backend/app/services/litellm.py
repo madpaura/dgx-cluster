@@ -20,6 +20,12 @@ class LiteLLMError(RuntimeError):
     pass
 
 
+def _first_line(text: str) -> str:
+    """Backend errors arrive as a wall of repr; the first line is the message."""
+    cleaned = text.strip().splitlines()[0] if text.strip() else ""
+    return cleaned[:240]
+
+
 class LiteLLMClient:
     def __init__(self, base_url: str | None = None, master_key: str | None = None) -> None:
         self.base_url = (base_url or settings.litellm_base_url).rstrip("/")
@@ -55,6 +61,59 @@ class LiteLLMClient:
             return {"reachable": True, "detail": info}
         except LiteLLMError as exc:
             return {"reachable": False, "detail": str(exc)}
+
+    async def backend_health(self) -> dict:
+        """LiteLLM's own view of whether each backend answers.
+
+        Worth having separately from dgxctl's: this is measured by the component
+        that actually routes traffic, so the two disagreeing is itself the
+        finding — a model dgxctl calls healthy that LiteLLM cannot reach is one
+        your users cannot use.
+        """
+        data = await self._request("GET", "/health")
+        healthy, unhealthy = [], []
+        for entry in data.get("healthy_endpoints", []) or []:
+            healthy.append({"model": entry.get("model", ""), "api_base": entry.get("api_base", "")})
+        for entry in data.get("unhealthy_endpoints", []) or []:
+            unhealthy.append({
+                "model": entry.get("model", ""),
+                "api_base": entry.get("api_base", ""),
+                "error": _first_line(str(entry.get("error", ""))),
+            })
+        return {"healthy": healthy, "unhealthy": unhealthy}
+
+    async def recent_traffic(self, limit: int = 500) -> dict:
+        """Token counts from the proxy's request log.
+
+        This is what actually went through LiteLLM, as opposed to what the vLLM
+        containers report — the gap between them is traffic that never reached a
+        backend.
+        """
+        try:
+            rows = await self._request("GET", f"/spend/logs?limit={int(limit)}")
+        except LiteLLMError:
+            return {"available": False, "requests": 0, "by_model": []}
+        if not isinstance(rows, list):
+            return {"available": False, "requests": 0, "by_model": []}
+
+        by_model: dict[str, dict] = {}
+        prompt = completion = 0
+        for row in rows:
+            name = row.get("model") or row.get("model_group") or "unknown"
+            entry = by_model.setdefault(name, {"model": name, "requests": 0, "tokens": 0})
+            entry["requests"] += 1
+            entry["tokens"] += int(row.get("total_tokens") or 0)
+            prompt += int(row.get("prompt_tokens") or 0)
+            completion += int(row.get("completion_tokens") or 0)
+
+        return {
+            "available": True,
+            "requests": len(rows),
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "window": f"last {len(rows)} requests",
+            "by_model": sorted(by_model.values(), key=lambda m: -m["requests"])[:12],
+        }
 
     async def list_models(self) -> list[dict]:
         data = await self._request("GET", "/model/info")

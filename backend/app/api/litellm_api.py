@@ -9,7 +9,7 @@ from ..auth import current_user, require_deployer
 from ..config import settings
 from ..db import get_db
 from ..models import User
-from ..services.litellm import LiteLLMClient, reconcile
+from ..services.litellm import LiteLLMClient, LiteLLMError, reconcile
 
 router = APIRouter(prefix="/api/litellm", tags=["litellm"])
 
@@ -26,6 +26,7 @@ async def status(_: User = Depends(current_user)):
         groups = await client.groups() if health["reachable"] else []
         return {
             "base_url": settings.litellm_base_url,
+            "console_url": _console_url(),
             "auto_register": settings.litellm_auto_register,
             "reachable": health["reachable"],
             "detail": health["detail"],
@@ -33,6 +34,37 @@ async def status(_: User = Depends(current_user)):
         }
     finally:
         await client.close()
+
+
+@router.get("/metrics")
+async def metrics(_: User = Depends(current_user)):
+    """What the proxy itself reports: which backends it can reach, and the
+    traffic that has gone through it.
+
+    Kept apart from /status because probing every backend takes as long as the
+    slowest one, and the status card should not wait on that.
+    """
+    client = LiteLLMClient()
+    try:
+        try:
+            backends = await client.backend_health()
+        except LiteLLMError as exc:
+            return {"reachable": False, "error": str(exc), "backends": None, "traffic": None}
+        return {
+            "reachable": True,
+            "console_url": _console_url(),
+            "backends": backends,
+            "traffic": await client.recent_traffic(),
+        }
+    finally:
+        await client.close()
+
+
+def _console_url() -> str:
+    """Where to send a browser. Falls back to the internal address, which is
+    right when dgxctl and the proxy are not in separate containers."""
+    base = (settings.litellm_public_url or settings.litellm_base_url).rstrip("/")
+    return f"{base}/ui/"
 
 
 @router.post("/test")

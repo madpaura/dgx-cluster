@@ -25,6 +25,30 @@ GPU_QUERY = (
 )
 
 
+def _host_key_policy() -> str | None:
+    """The known_hosts file to verify against, or None to skip verification.
+
+    Skipping means anything that can answer on the node's address is trusted
+    with whatever the control server sends it — including the command that
+    launches containers. Warned about once at startup rather than per
+    connection, so it is visible in the log without drowning it.
+    """
+    path = settings.ssh_known_hosts.strip()
+    if path:
+        return path
+    if not _host_key_policy._warned:
+        log.warning(
+            "SSH host keys are not being verified: DGXCTL_SSH_KNOWN_HOSTS is unset. "
+            "Anything answering on a node's address will be trusted. Point it at a "
+            "known_hosts file once the fleet's keys are collected."
+        )
+        _host_key_policy._warned = True
+    return None
+
+
+_host_key_policy._warned = False
+
+
 class SSHDriver(NodeDriver):
     def __init__(self) -> None:
         self._conns: dict[str, asyncssh.SSHClientConnection] = {}
@@ -46,7 +70,7 @@ class SSHDriver(NodeDriver):
                     port=node.ssh_port,
                     username=node.ssh_user or settings.ssh_user,
                     client_keys=[settings.ssh_key_path],
-                    known_hosts=None,  # private fleet; pin via known_hosts file if you prefer
+                    known_hosts=_host_key_policy(),
                 ),
                 timeout=settings.ssh_connect_timeout,
             )

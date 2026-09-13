@@ -15,6 +15,8 @@ export interface Gpu {
   ecc_errors: number;
   deployment_id: string | null;
   model_name: string | null;
+  tenants: { deployment_id: string; model_name: string; reserved_mb: number }[];
+  reserved_mb: number;
 }
 
 export interface Cluster {
@@ -65,6 +67,7 @@ export interface Deployment {
   node_id: string;
   node_name: string;
   gpu_indices: number[];
+  reserved_mb_per_gpu: number;
   port: number;
   endpoint: string;
   status: DeployStatus;
@@ -123,7 +126,30 @@ export interface Placement {
   gpu_indices: number[];
   gpu_model: string;
   free_gb_per_gpu: number;
+  reserve_gb_per_gpu: number;
+  shares_with: number;
   note: string;
+}
+
+export interface Estimate {
+  total_gb_per_gpu: number;
+  weights_gb: number;
+  kv_cache_gb: number;
+  overhead_gb: number;
+  minimum_gb_per_gpu: number;
+  concurrent_sequences: number;
+  tensor_parallel: number;
+  max_model_len: number;
+  params_b: number;
+  source: string;
+  detail: string;
+}
+
+export interface Check {
+  severity: "error" | "warning" | "info";
+  title: string;
+  detail: string;
+  fix: string;
 }
 
 export interface Plan {
@@ -132,6 +158,9 @@ export interface Plan {
   per_gpu_gb: number;
   tensor_parallel_size: number;
   argv: string[];
+  estimate: Estimate | null;
+  checks: Check[];
+  blocked: boolean;
 }
 
 export interface Finding {
@@ -172,8 +201,27 @@ export interface LiteLLMMember {
   deployment_id: string;
 }
 
+export interface LiteLLMMetrics {
+  reachable: boolean;
+  error?: string;
+  console_url?: string;
+  backends: {
+    healthy: { model: string; api_base: string }[];
+    unhealthy: { model: string; api_base: string; error: string }[];
+  } | null;
+  traffic: {
+    available: boolean;
+    requests: number;
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    window?: string;
+    by_model: { model: string; requests: number; tokens: number }[];
+  } | null;
+}
+
 export interface LiteLLMStatus {
   base_url: string;
+  console_url: string;
   auto_register: boolean;
   reachable: boolean;
   detail: unknown;
