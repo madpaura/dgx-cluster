@@ -17,6 +17,7 @@ from ..schemas import (
 )
 from ..services import deployments as deploy_svc
 from ..services import diagnostics
+from ..services.capacity import node_capacity
 from ..services.placement import plan as plan_placements
 
 router = APIRouter(prefix="/api/deployments", tags=["deployments"])
@@ -100,10 +101,23 @@ async def plan_deployment(
         nodes = [n for n in nodes if n.id in set(body.node_ids)]
 
     placements, rejections = plan_placements(nodes, per_gpu_gb=per_gpu_gb, tp=tp)
+
+    # Show the command that would actually run, which means deriving the memory
+    # share the same way the deploy will: from this model's slice of the card it
+    # would land on, not from a fixed fraction.
+    share = body.gpu_memory_utilization
+    if share is None:
+        card_mb = 0
+        if placements:
+            node = next(n for n in nodes if n.id == placements[0].node_id)
+            card_mb = max((g.memory_total_mb for g in node.gpus
+                           if g.index in placements[0].gpu_indices), default=0)
+        share = round(per_gpu_gb * 1024 / card_mb, 3) if card_mb else 0.90
+
     argv = deploy_svc.build_vllm_args(
         hf_repo=hf_repo, served_model_name=name, tensor_parallel_size=tp,
         max_model_len=max_len, quantization=body.quantization or (spec.quantization if spec else ""),
-        gpu_memory_utilization=body.gpu_memory_utilization,
+        gpu_memory_utilization=share,
         revision=spec.revision if spec else "",
         extra_args={**(spec.extra_args if spec else {}), **body.extra_args},
     )
@@ -111,7 +125,9 @@ async def plan_deployment(
         placements=[
             PlacementOut(
                 node_id=p.node_id, node_name=p.node_name, gpu_indices=p.gpu_indices,
-                gpu_model=p.gpu_model, free_gb_per_gpu=round(p.free_mb_per_gpu / 1024, 1), note=p.note,
+                gpu_model=p.gpu_model, free_gb_per_gpu=round(p.free_mb_per_gpu / 1024, 1),
+                reserve_gb_per_gpu=round(p.reserve_mb_per_gpu / 1024, 1),
+                shares_with=p.shares_with, note=p.note,
             )
             for p in placements
         ],
@@ -133,7 +149,7 @@ async def create_deployment(
 
     explicit = [deploy_svc.Target(node_id=t.node_id, gpu_indices=t.gpu_indices) for t in body.targets] or None
     if explicit:
-        await _check_free(db, explicit)
+        await _check_free(db, explicit, per_gpu_gb)
 
     # Placement reads the fleet without holding the allocation lock, so another
     # caller can claim the chosen GPUs in between. The claim itself is checked
@@ -155,14 +171,14 @@ async def create_deployment(
             await _check_quota(db, actor_role, actor_team, targets)
             deps = await deploy_svc.create(
                 db, actor=actor, served_model_name=name, hf_repo=hf_repo, targets=targets,
-                tensor_parallel_size=tp, spec=spec, max_model_len=max_len,
+                tensor_parallel_size=tp, per_gpu_gb=per_gpu_gb, spec=spec, max_model_len=max_len,
                 quantization=body.quantization or "", gpu_memory_utilization=body.gpu_memory_utilization,
                 extra_args=body.extra_args, image=body.image,
                 team_id=body.team_id or actor_team,
             )
             break
         except deploy_svc.DeployError as exc:
-            lost_the_race = "already in use" in str(exc) and attempt < attempts - 1
+            lost_the_race = "refresh and pick again" in str(exc) and attempt < attempts - 1
             if lost_the_race:
                 await db.rollback()
                 continue
@@ -173,20 +189,33 @@ async def create_deployment(
     return [to_out(d) for d in deps]
 
 
-async def _check_free(db: AsyncSession, targets: list[deploy_svc.Target]) -> None:
-    """Manual GPU picks still have to be free — the UI can be stale."""
+async def _check_free(db: AsyncSession, targets: list[deploy_svc.Target], per_gpu_gb: float) -> None:
+    """Manual GPU picks still have to have room — the UI can be stale.
+
+    Room, not emptiness: several models share a card when the reservations fit,
+    so what disqualifies a GPU is a shortfall, not an existing tenant.
+    """
+    need_mb = int(round(per_gpu_gb * 1024))
     for t in targets:
         node = await db.get(Node, t.node_id)
         if node is None:
             raise HTTPException(404, f"unknown node {t.node_id}")
-        busy = {int(i) for d in node.deployments if d.status in ACTIVE_STATUSES for i in d.gpu_indices}
-        clash = sorted(set(t.gpu_indices) & busy)
-        if clash:
-            raise HTTPException(409, f"{node.name} GPU {clash} already in use; refresh and pick again")
         known = {g.index for g in node.gpus}
         unknown = sorted(set(t.gpu_indices) - known)
         if unknown:
             raise HTTPException(400, f"{node.name} has no GPU {unknown}")
+
+        capacity = node_capacity(node)
+        short = {i: capacity.get(i, 0) for i in t.gpu_indices if capacity.get(i, 0) < need_mb}
+        if short:
+            detail = ", ".join(
+                f"GPU {i} has {mb / 1024:.0f} GiB free" for i, mb in sorted(short.items())
+            )
+            raise HTTPException(
+                409,
+                f"{node.name} cannot fit {per_gpu_gb:.0f} GiB per GPU: {detail}; "
+                f"refresh and pick again",
+            )
 
 
 async def _check_quota(db: AsyncSession, role: Role, team_id: str | None, targets) -> None:

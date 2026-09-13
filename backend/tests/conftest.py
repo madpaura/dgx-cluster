@@ -134,6 +134,26 @@ async def set_role(role: Role, team_id: str | None = None) -> None:
         await session.commit()
 
 
+async def deploy_undersized(client, node_id: str, gpu_indices: list[int]) -> dict:
+    """Deploy a model whose catalog entry understates what it needs.
+
+    Placement believes it fits and reserves the stated share; the container then
+    runs out of memory on the node. That is the failure the diagnostics engine
+    exists for, and the only way a model still OOMs now that capacity is checked
+    before launch — a wrong number in the catalog.
+    """
+    await client.post("/api/catalog", json={
+        "key": "mis-sized", "display_name": "Mis-sized 70B",
+        "hf_repo": "meta-llama/Llama-3.3-70B-Instruct",
+        "params_b": 70, "min_gpu_memory_gb": 10, "recommended_tp": 2,
+    })
+    r = await client.post("/api/deployments", json={
+        "spec_key": "mis-sized",
+        "targets": [{"node_id": node_id, "gpu_indices": gpu_indices}],
+    })
+    return r.json()[0]
+
+
 async def pump(times: int = 1, gap: float = 0.0) -> None:
     """Run one full worker cycle: observe containers, then scrape metrics.
 

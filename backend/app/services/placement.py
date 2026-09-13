@@ -9,9 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..models import ACTIVE_STATUSES, Node
-
-# Headroom left on a GPU beyond the model's own need (CUDA context, fragmentation).
-RESERVE_MB = 1500
+from .capacity import RESERVE_MB, node_capacity, tenants  # noqa: F401
 
 
 @dataclass
@@ -21,8 +19,10 @@ class Placement:
     gpu_indices: list[int]
     gpu_model: str
     free_mb_per_gpu: int
+    reserve_mb_per_gpu: int
     score: float
     note: str = ""
+    shares_with: int = 0        # models already on the chosen GPUs
 
 
 @dataclass
@@ -52,7 +52,7 @@ def plan(
     The rejection list matters as much as the placements — it is what turns
     "no capacity" from a dead end into something the operator can act on.
     """
-    need_mb = int(per_gpu_gb * 1024) + RESERVE_MB
+    need_mb = int(per_gpu_gb * 1024)   # headroom is already held back by node_capacity
     options: list[Placement] = []
     rejections: list[Rejection] = []
     exclude_node_ids = exclude_node_ids or set()
@@ -70,38 +70,42 @@ def plan(
             rejections.append(Rejection(node.name, f"has {len(node.gpus)} GPUs, needs {tp}"))
             continue
 
-        busy = busy_gpu_indices(node)
-        free = [g for g in node.gpus if g.index not in busy]
-        if len(free) < tp:
-            rejections.append(
-                Rejection(node.name, f"only {len(free)} of {len(node.gpus)} GPUs free, needs {tp}")
-            )
-            continue
+        capacity = node_capacity(node)
+        occupants = tenants(node)
 
-        fits = [g for g in free if (g.memory_total_mb - g.memory_used_mb) >= need_mb]
+        fits = [g for g in node.gpus if capacity.get(g.index, 0) >= need_mb]
         if len(fits) < tp:
-            biggest = max((g.memory_total_mb - g.memory_used_mb for g in free), default=0)
+            biggest = max(capacity.values(), default=0)
+            roomy = len([v for v in capacity.values() if v >= need_mb])
             rejections.append(
                 Rejection(
                     node.name,
-                    f"needs {need_mb / 1024:.0f} GiB per GPU, largest free GPU has {biggest / 1024:.0f} GiB",
+                    f"needs {need_mb / 1024:.0f} GiB free per GPU; "
+                    f"{roomy} of {len(node.gpus)} GPUs have that "
+                    f"(most free: {biggest / 1024:.0f} GiB)",
                 )
             )
             continue
 
-        group = _pick_group(fits, tp)
+        group = _pick_group(fits, tp, capacity)
         if group is None:
-            rejections.append(Rejection(node.name, f"no homogeneous group of {tp} GPUs available"))
+            rejections.append(Rejection(node.name, f"no homogeneous group of {tp} GPUs has room"))
             continue
 
-        free_mb = min(g.memory_total_mb - g.memory_used_mb for g in group)
-        # Best-fit: prefer the node with the fewest spare GPUs left over, so big
-        # contiguous blocks stay available for models that actually need them.
-        leftover = len(free) - tp
-        score = leftover * 100 + (free_mb - need_mb) / 1024
+        free_mb = min(capacity[g.index] for g in group)
+        sharing = max(len(occupants.get(g.index, [])) for g in group)
+
+        # Best-fit on the leftover, so a small model lands on a card that is
+        # already partly used rather than opening a fresh one — whole GPUs stay
+        # available for the models that genuinely need them.
+        leftover_gb = (free_mb - need_mb) / 1024
+        score = leftover_gb + (len(node.gpus) - len(group)) * 0.5
         note = ""
+        if sharing:
+            note = f"shares with {sharing} model{'s' if sharing > 1 else ''}"
+            score -= 20     # prefer packing over opening another card
         if tp > 1 and group[-1].index - group[0].index == tp - 1 and group[0].index % tp == 0:
-            note = "aligned NVLink group"
+            note = ("aligned NVLink group" + (f", {note}" if note else ""))
             score -= 25
         options.append(
             Placement(
@@ -110,8 +114,10 @@ def plan(
                 gpu_indices=[g.index for g in group],
                 gpu_model=group[0].name,
                 free_mb_per_gpu=free_mb,
+                reserve_mb_per_gpu=need_mb,
                 score=score,
                 note=note,
+                shares_with=sharing,
             )
         )
 
@@ -119,9 +125,10 @@ def plan(
     return options, rejections
 
 
-def _pick_group(candidates: list, tp: int):
+def _pick_group(candidates: list, tp: int, capacity: dict[int, int]):
     """Prefer an aligned contiguous run of identical GPUs; fall back to any
-    identical set. Tensor parallel across mixed GPU models is never right."""
+    identical set. Tensor parallel across mixed GPU models is never right, and
+    a group whose members have unequal room is limited by its smallest."""
     by_model: dict[str, list] = {}
     for g in candidates:
         by_model.setdefault(g.name, []).append(g)
@@ -139,5 +146,7 @@ def _pick_group(candidates: list, tp: int):
             window = group[start : start + tp]
             if window[-1].index - window[0].index == tp - 1:
                 return window
-        return group[:tp]
+        # Nothing contiguous: take the fullest cards that still fit, so the
+        # emptiest ones stay whole.
+        return sorted(group, key=lambda g: capacity[g.index])[:tp]
     return None

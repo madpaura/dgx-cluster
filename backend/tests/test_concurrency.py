@@ -36,20 +36,28 @@ async def _deploy_all(client, n: int, **body) -> list[int]:
     return [r.status_code for r in results]
 
 
-async def test_simultaneous_deploys_never_hand_out_the_same_gpu(client):
-    """rtx-ws-01 has two GPUs and the model needs one each, so at most two of
-    the six callers can win. What matters is that no GPU appears twice."""
-    ids = await register_fleet(["rtx-ws-01"])
+async def test_simultaneous_deploys_never_oversubscribe_a_gpu(client):
+    """Sharing is allowed, overcommitting is not: the reservations on any one
+    card must never exceed what the card has."""
+    ids = await register_fleet(["rtx-ws-01"])       # 2x 48 GiB, model wants 22
 
-    codes = await _deploy_all(client, 6, spec_key="llama3.1-8b", replicas=1,
+    codes = await _deploy_all(client, 8, spec_key="llama3.1-8b", replicas=1,
                               node_ids=[ids["rtx-ws-01"]])
     assert 201 in codes, f"at least one caller must succeed: {codes}"
 
+    node = (await client.get(f"/api/nodes/{ids['rtx-ws-01']}")).json()
     live = (await client.get("/api/deployments")).json()
-    claimed = [tuple(d["gpu_indices"]) for d in live]
-    duplicated = [gpus for gpus, n in Counter(claimed).items() if n > 1]
-    assert not duplicated, f"GPUs handed out more than once: {duplicated}"
-    assert len(live) <= 2, f"node has 2 GPUs but {len(live)} deployments claim it"
+
+    per_gpu: dict[int, int] = {}
+    for d in live:
+        for i in d["gpu_indices"]:
+            per_gpu[i] = per_gpu.get(i, 0) + d["reserved_mb_per_gpu"]
+    for gpu in node["gpus"]:
+        assert per_gpu.get(gpu["index"], 0) <= gpu["memory_total_mb"], (
+            f"GPU {gpu['index']} oversubscribed: "
+            f"{per_gpu[gpu['index']]} MB reserved of {gpu['memory_total_mb']} MB"
+        )
+    assert sum(per_gpu.values()) > 0
 
 
 async def test_simultaneous_deploys_never_hand_out_the_same_port(client):
@@ -68,20 +76,21 @@ async def test_simultaneous_deploys_never_hand_out_the_same_port(client):
 
 
 async def test_a_caller_that_named_exact_gpus_is_refused_rather_than_moved(client):
-    """Someone who asked for GPU 0 specifically must not be silently placed
-    somewhere else; they need to know their choice was taken."""
+    """Two 40 GiB models cannot both fit a 48 GiB card. Whoever loses asked for
+    GPU 0 specifically and must be told, not silently placed elsewhere."""
     ids = await register_fleet(["dgx-01"])
     target = [{"node_id": ids["dgx-01"], "gpu_indices": [0]}]
 
     results = await asyncio.gather(
-        _deploy(client, spec_key="llama3.1-8b", targets=target),
-        _deploy(client, spec_key="llama3.1-8b", targets=target),
+        _deploy(client, spec_key="qwen3-32b", tensor_parallel_size=1, targets=target),
+        _deploy(client, spec_key="qwen3-32b", served_model_name="rival",
+                tensor_parallel_size=1, targets=target),
     )
     codes = sorted(r.status_code for r in results)
     assert codes == [201, 409], f"expected one win and one refusal, got {codes}"
 
     loser = next(r for r in results if r.status_code == 409)
-    assert "already in use" in loser.json()["detail"]
+    assert "cannot fit" in loser.json()["detail"]
 
 
 async def test_an_automatically_placed_deploy_is_re_placed_after_losing_a_race(client):
@@ -92,9 +101,17 @@ async def test_an_automatically_placed_deploy_is_re_placed_after_losing_a_race(c
     codes = await _deploy_all(client, 6, spec_key="llama3.1-8b", replicas=1)
     assert codes.count(201) == 6, f"the fleet had room for all six: {codes}"
 
+    # Several may legitimately land on one card; what must hold is that no card
+    # promised more than it has.
     live = (await client.get("/api/deployments")).json()
-    claimed = [(d["node_name"], tuple(d["gpu_indices"])) for d in live]
-    assert len(claimed) == len(set(claimed)), f"double-booked: {claimed}"
+    nodes = {n["id"]: n for n in (await client.get("/api/nodes")).json()}
+    per_gpu: dict[tuple[str, int], int] = {}
+    for d in live:
+        for i in d["gpu_indices"]:
+            per_gpu[(d["node_id"], i)] = per_gpu.get((d["node_id"], i), 0) + d["reserved_mb_per_gpu"]
+    for (node_id, index), reserved in per_gpu.items():
+        total = next(g["memory_total_mb"] for g in nodes[node_id]["gpus"] if g["index"] == index)
+        assert reserved <= total, f"{nodes[node_id]['name']} GPU {index} oversubscribed"
 
 
 async def test_a_claim_is_visible_to_other_callers_before_the_container_starts(client):

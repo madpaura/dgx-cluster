@@ -15,7 +15,7 @@ from httpx import ASGITransport
 
 from app.main import app
 from app.mcp_server import AGENT_EMAIL, build_mcp_app, mcp
-from tests.conftest import pump, register_fleet
+from tests.conftest import deploy_undersized, pump, register_fleet
 
 HDRS = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
 
@@ -209,10 +209,7 @@ async def test_events_are_readable_and_filterable(agent, client):
 async def test_logs_come_back_diagnosed_with_a_fix(agent, client):
     """An agent must not have to parse a vLLM traceback."""
     ids = await register_fleet(["rtx-ws-01"])
-    dep = (await client.post("/api/deployments", json={
-        "hf_repo": "meta-llama/Llama-3.3-70B-Instruct", "served_model_name": "too-big",
-        "tensor_parallel_size": 2,
-        "targets": [{"node_id": ids["rtx-ws-01"], "gpu_indices": [0, 1]}]})).json()[0]
+    dep = await deploy_undersized(client, ids["rtx-ws-01"], [0, 1])
     await pump()
 
     body = await agent.call("deployment_logs", deployment_id=dep["id"])

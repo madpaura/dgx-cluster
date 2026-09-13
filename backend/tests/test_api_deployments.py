@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from app.drivers import get_driver
 from app.models import Role
-from tests.conftest import pump, register_fleet, set_role
+from tests.conftest import deploy_undersized, pump, register_fleet, set_role
 
 
 # ------------------------------------------------------------------- planning
@@ -107,14 +107,44 @@ async def test_explicit_gpu_targets_are_honoured(client):
     assert dep["gpu_indices"] == [4, 5]
 
 
-async def test_double_booking_a_gpu_is_refused(client):
+async def test_a_second_model_may_share_a_gpu_that_has_room(client):
+    """22 GiB of an 80 GiB H100 leaves plenty; a whole card per small model is
+    exactly the waste this is meant to avoid."""
     ids = await register_fleet(["dgx-01"])
-    await client.post("/api/deployments", json={
-        "spec_key": "llama3.1-8b", "targets": [{"node_id": ids["dgx-01"], "gpu_indices": [0]}]})
+    target = [{"node_id": ids["dgx-01"], "gpu_indices": [0]}]
+    first = await client.post("/api/deployments", json={"spec_key": "llama3.1-8b", "targets": target})
+    second = await client.post("/api/deployments", json={
+        "spec_key": "llama3.1-8b", "served_model_name": "second-8b", "targets": target})
+
+    assert first.status_code == 201 and second.status_code == 201
+    assert first.json()[0]["gpu_indices"] == second.json()[0]["gpu_indices"] == [0]
+    assert first.json()[0]["port"] != second.json()[0]["port"]
+
+
+async def test_each_tenant_is_told_to_take_only_its_share(client):
+    """--gpu-memory-utilization is a fraction of the WHOLE card, so a fixed 0.9
+    would leave nothing for anyone else however little the model needs."""
+    ids = await register_fleet(["dgx-01"])
+    dep = (await client.post("/api/deployments", json={
+        "spec_key": "llama3.1-8b",
+        "targets": [{"node_id": ids["dgx-01"], "gpu_indices": [0]}]})).json()[0]
+
+    argv = dep["vllm_args"]["argv"]
+    share = float(argv[argv.index("--gpu-memory-utilization") + 1])
+    assert 0.2 < share < 0.4, f"a 22 GiB model on an 80 GiB card asked for {share}"
+    assert dep["reserved_mb_per_gpu"] == 22 * 1024
+
+
+async def test_sharing_is_refused_once_the_vram_runs_out(client):
+    ids = await register_fleet(["rtx-ws-01"])       # 2x 48 GiB
+    target = [{"node_id": ids["rtx-ws-01"], "gpu_indices": [0]}]
+    assert (await client.post("/api/deployments", json={
+        "spec_key": "llama3.1-8b", "targets": target})).status_code == 201
     r = await client.post("/api/deployments", json={
-        "spec_key": "llama3.1-8b", "targets": [{"node_id": ids["dgx-01"], "gpu_indices": [0]}]})
+        "spec_key": "qwen3-32b", "served_model_name": "too-big-now",
+        "tensor_parallel_size": 1, "targets": target})
     assert r.status_code == 409
-    assert "GPU [0] already in use" in r.json()["detail"]
+    assert "cannot fit" in r.json()["detail"] and "GPU 0 has" in r.json()["detail"]
 
 
 async def test_targeting_a_gpu_that_does_not_exist_is_refused(client):
@@ -195,11 +225,7 @@ async def test_a_model_that_does_not_fit_fails_with_a_cause_and_a_fix(client):
     """The end-to-end diagnostic path: oversized model -> OOM in the container
     -> failed status -> a finding that names the fix."""
     ids = await register_fleet(["rtx-ws-01"])
-    dep = (await client.post("/api/deployments", json={
-        "hf_repo": "meta-llama/Llama-3.3-70B-Instruct", "served_model_name": "too-big",
-        "tensor_parallel_size": 2,
-        "targets": [{"node_id": ids["rtx-ws-01"], "gpu_indices": [0, 1]}],
-    })).json()[0]
+    dep = await deploy_undersized(client, ids["rtx-ws-01"], [0, 1])
     await pump()
 
     after = (await client.get(f"/api/deployments/{dep['id']}")).json()

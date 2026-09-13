@@ -57,7 +57,7 @@ async def test_a_custom_entry_drives_placement(client):
     plan = (await client.post("/api/deployments/plan", json={"spec_key": "huge"})).json()
     assert plan["per_gpu_gb"] == 200
     assert plan["placements"] == []
-    assert "needs 201 GiB per GPU" in plan["rejections"][0]["reason"]
+    assert "needs 200 GiB free per GPU" in plan["rejections"][0]["reason"]
 
 
 async def test_catalog_extra_args_reach_the_container(client):

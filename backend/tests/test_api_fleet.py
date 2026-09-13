@@ -7,7 +7,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.api import fleet as fleet_module
 from app.main import app
-from tests.conftest import pump, register_fleet
+from tests.conftest import deploy_undersized, pump, register_fleet
 
 
 @pytest.fixture(autouse=True)
@@ -51,10 +51,7 @@ async def test_summary_tracks_deployments_and_throughput(client):
 
 async def test_summary_counts_failures_separately(client):
     ids = await register_fleet(["rtx-ws-01"])
-    await client.post("/api/deployments", json={
-        "hf_repo": "meta-llama/Llama-3.3-70B-Instruct", "served_model_name": "too-big",
-        "tensor_parallel_size": 2,
-        "targets": [{"node_id": ids["rtx-ws-01"], "gpu_indices": [0, 1]}]})
+    await deploy_undersized(client, ids["rtx-ws-01"], [0, 1])
     await pump()
     s = (await client.get("/api/summary")).json()
     assert s["deployments_failed"] == 1
@@ -133,10 +130,7 @@ async def test_the_summary_ignores_failures_that_are_no_longer_actionable(client
     from app.models import Deployment
 
     ids = await register_fleet(["rtx-ws-01"])
-    await client.post("/api/deployments", json={
-        "hf_repo": "meta-llama/Llama-3.3-70B-Instruct", "served_model_name": "too-big",
-        "tensor_parallel_size": 2,
-        "targets": [{"node_id": ids["rtx-ws-01"], "gpu_indices": [0, 1]}]})
+    await deploy_undersized(client, ids["rtx-ws-01"], [0, 1])
     await pump()
     assert (await client.get("/api/summary")).json()["deployments_failed"] == 1
 

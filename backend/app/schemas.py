@@ -172,7 +172,10 @@ class DeployRequest(BaseModel):
     tensor_parallel_size: int | None = None
     max_model_len: int = 0
     quantization: str | None = None
-    gpu_memory_utilization: float = 0.90
+    # Unset means "derive it from the share this model was given", which is what
+    # lets several models sit on one card. A number here overrides that and is
+    # read as a fraction of the whole GPU, the way vLLM reads it.
+    gpu_memory_utilization: float | None = None
     extra_args: dict = {}
     image: str = ""
     team_id: str | None = None
@@ -186,6 +189,7 @@ class DeploymentOut(ORM):
     node_id: str
     node_name: str = ""
     gpu_indices: list = []
+    reserved_mb_per_gpu: int = 0
     port: int
     endpoint: str = ""
     status: DeployStatus
@@ -208,6 +212,8 @@ class PlacementOut(BaseModel):
     gpu_indices: list[int]
     gpu_model: str
     free_gb_per_gpu: float
+    reserve_gb_per_gpu: float = 0
+    shares_with: int = 0
     note: str = ""
 
 

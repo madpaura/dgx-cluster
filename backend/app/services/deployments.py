@@ -23,7 +23,8 @@ from ..config import settings
 from ..drivers import LaunchSpec, get_driver
 from ..models import ACTIVE_STATUSES, Deployment, DeployStatus, ModelSpec, Node, NodeStatus
 from . import litellm as litellm_svc
-from .placement import Placement, busy_gpu_indices, plan
+from .capacity import node_capacity
+from .placement import Placement, plan
 
 log = logging.getLogger(__name__)
 
@@ -161,10 +162,11 @@ async def create(
     hf_repo: str,
     targets: list[Target],
     tensor_parallel_size: int,
+    per_gpu_gb: float,
     spec: ModelSpec | None = None,
     max_model_len: int = 0,
     quantization: str = "",
-    gpu_memory_utilization: float = 0.90,
+    gpu_memory_utilization: float | None = None,
     extra_args: dict | None = None,
     image: str = "",
     team_id: str | None = None,
@@ -173,7 +175,8 @@ async def create(
     nodes where one is down still gives you five."""
     created = await _reserve(
         db, actor=actor, served_model_name=served_model_name, hf_repo=hf_repo,
-        targets=targets, tensor_parallel_size=tensor_parallel_size, spec=spec,
+        targets=targets, tensor_parallel_size=tensor_parallel_size,
+        per_gpu_gb=per_gpu_gb, spec=spec,
         max_model_len=max_model_len, quantization=quantization,
         gpu_memory_utilization=gpu_memory_utilization, extra_args=extra_args,
         image=image, team_id=team_id,
@@ -190,10 +193,11 @@ async def _reserve(
     hf_repo: str,
     targets: list[Target],
     tensor_parallel_size: int,
+    per_gpu_gb: float,
     spec: ModelSpec | None,
     max_model_len: int,
     quantization: str,
-    gpu_memory_utilization: float,
+    gpu_memory_utilization: float | None,
     extra_args: dict | None,
     image: str,
     team_id: str | None,
@@ -216,10 +220,19 @@ async def _reserve(
             if node.status in (NodeStatus.draining, NodeStatus.maintenance):
                 raise DeployError(f"{node.name} is {node.status.value}; not accepting deployments")
 
-            clash = sorted(set(target.gpu_indices) & busy_gpu_indices(node))
-            if clash:
+            reserve_mb = int(round(per_gpu_gb * 1024))
+            capacity = node_capacity(node)
+            short = {
+                i: capacity.get(i, 0) for i in target.gpu_indices
+                if capacity.get(i, 0) < reserve_mb
+            }
+            if short:
+                detail = ", ".join(
+                    f"GPU {i} has {mb / 1024:.0f} GiB free" for i, mb in sorted(short.items())
+                )
                 raise DeployError(
-                    f"{node.name} GPU {clash} already in use; refresh and pick again"
+                    f"{node.name} cannot fit {per_gpu_gb:.0f} GiB per GPU: {detail}; "
+                    f"refresh and pick again"
                 )
 
             port = await allocate_port(db, node.id)
@@ -231,6 +244,7 @@ async def _reserve(
                 node_id=node.id,
                 node=node,
                 gpu_indices=list(target.gpu_indices),
+                reserved_mb_per_gpu=reserve_mb,
                 port=port,
                 status=DeployStatus.pending,
                 status_reason="claimed; starting container",
@@ -240,13 +254,23 @@ async def _reserve(
                 created_by=actor,
             )
             dep.container_name = f"{settings.container_prefix}-{slugify(served_model_name)}-{dep.id[:8]}"
+            # The fraction is derived from the reservation rather than fixed,
+            # because --gpu-memory-utilization is a share of the WHOLE card: a
+            # default of 0.9 would have the first model claim almost all of it
+            # however little it needs, and nothing could ever share the GPU.
+            largest = max((g.memory_total_mb for g in node.gpus if g.index in target.gpu_indices),
+                          default=0)
+            share = gpu_memory_utilization
+            if share is None:
+                share = round(reserve_mb / largest, 3) if largest else 0.90
+
             dep.vllm_args = {"argv": build_vllm_args(
                 hf_repo=hf_repo,
                 served_model_name=served_model_name,
                 tensor_parallel_size=tensor_parallel_size,
                 max_model_len=max_model_len,
                 quantization=quantization or (spec.quantization if spec else ""),
-                gpu_memory_utilization=gpu_memory_utilization,
+                gpu_memory_utilization=share,
                 revision=spec.revision if spec else "",
                 extra_args={**(spec.extra_args if spec else {}), **(extra_args or {})},
             )}

@@ -199,6 +199,11 @@ class Deployment(Base):
     node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
     node: Mapped[Node] = relationship(back_populates="deployments", lazy="selectin")
     gpu_indices: Mapped[list] = mapped_column(JSONType, default=list)
+    # VRAM this deployment holds on EACH of its GPUs. A GPU is a pool, not a
+    # slot: several models share one card as long as the reservations fit, and
+    # this is the ledger that decides whether they do. vLLM is told the matching
+    # --gpu-memory-utilization so it reserves exactly this much and no more.
+    reserved_mb_per_gpu: Mapped[int] = mapped_column(Integer, default=0)
     port: Mapped[int] = mapped_column(Integer)
 
     status: Mapped[DeployStatus] = mapped_column(Enum(DeployStatus), default=DeployStatus.pending, index=True)
