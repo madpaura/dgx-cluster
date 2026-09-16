@@ -111,6 +111,14 @@ def params_from_name(repo: str) -> float:
     return float(match.group(1)) if match else 7.0
 
 
+def _quantization_from_name(repo: str) -> str:
+    lowered = repo.lower()
+    for scheme in ("fp8", "awq", "gptq", "int4", "bitsandbytes"):
+        if scheme in lowered:
+            return scheme
+    return ""
+
+
 def params_from_config(config: dict) -> float:
     """Approximate parameter count from the transformer's shape.
 
@@ -183,7 +191,10 @@ async def assess(
 
     if config is None:
         params = params_from_name(hf_repo)
-        weights = params * _weight_bytes(None, quantization) / max(tensor_parallel, 1)
+        # Without a config to read, the repo name is all there is — and it
+        # almost always says: -FP8, -AWQ, -GPTQ, -int4.
+        inferred = quantization or _quantization_from_name(hf_repo)
+        weights = params * _weight_bytes(None, inferred) / max(tensor_parallel, 1)
         sized = catalog_gb or (weights + 8)
         estimate = Estimate(
             total_gb_per_gpu=round(sized, 1),
@@ -302,6 +313,89 @@ async def assess(
         ))
 
     return Assessment(estimate, checks)
+
+
+@dataclass
+class Option:
+    """A concrete change that would make the model fit."""
+    change: str
+    needs_gb_per_gpu: float
+    detail: str
+
+
+def recommend(
+    estimate: Estimate,
+    *,
+    config: dict | None,
+    largest_free_gb: float,
+    gpus_on_best_node: int,
+    quantization: str = "",
+) -> list[Option]:
+    """What to change when it does not fit.
+
+    Ordered by how little they cost you: splitting across more GPUs keeps the
+    model intact, shortening the context trades capability you may not be using,
+    and a quantized checkpoint trades a little accuracy. Each is only offered if
+    it would actually fit the hardware in front of you.
+    """
+    if largest_free_gb <= 0:
+        return []
+    options: list[Option] = []
+    weights, overhead = estimate.weights_gb, estimate.overhead_gb
+    # One sequence, since that is what has to fit for the engine to start.
+    kv = max(estimate.minimum_gb_per_gpu - weights - overhead, 0.0)
+    tp = max(estimate.tensor_parallel, 1)
+
+    # Split wider. Weights and KV cache both divide; overhead does not.
+    heads = (config or {}).get("num_attention_heads") or 0
+    for wider in (2, 4, 8):
+        if wider <= tp or wider > gpus_on_best_node:
+            continue
+        if heads and heads % wider:
+            continue
+        need = (weights + kv) * tp / wider + overhead
+        if need <= largest_free_gb:
+            options.append(Option(
+                change=f"tensor-parallel {wider}",
+                needs_gb_per_gpu=round(need, 1),
+                detail=(f"Splits the model across {wider} GPUs instead of {tp}. "
+                        f"Keeps the full model and the full context."),
+            ))
+            break
+
+    # Shorten the context. KV cache is linear in it.
+    if kv > 1 and estimate.max_model_len > 2048:
+        for divisor in (2, 4, 8):
+            shorter = estimate.max_model_len // divisor
+            if shorter < 2048:
+                break
+            need = weights + kv / divisor + overhead
+            if need <= largest_free_gb:
+                options.append(Option(
+                    change=f"--max-model-len {shorter}",
+                    needs_gb_per_gpu=round(need, 1),
+                    detail=(f"The KV cache is linear in context length, so a "
+                            f"{divisor}x shorter window costs {divisor}x less. "
+                            f"Requests longer than {shorter} tokens are refused."),
+                ))
+                break
+
+    # A smaller checkpoint. Only worth saying if it is not already quantized.
+    if not quantization:
+        for scheme, bytes_per, note in (
+            ("FP8", 1.0, "needs Hopper or newer"),
+            ("AWQ or GPTQ (4-bit)", 0.5, "runs on any card vLLM supports"),
+        ):
+            need = weights * bytes_per / 2 + kv + overhead
+            if need <= largest_free_gb:
+                options.append(Option(
+                    change=f"an {scheme} build of this model",
+                    needs_gb_per_gpu=round(need, 1),
+                    detail=f"Weights shrink to {bytes_per:g} bytes per parameter; {note}.",
+                ))
+                break
+
+    return options
 
 
 def _divisors(n: int) -> list[int]:

@@ -4,7 +4,7 @@ from __future__ import annotations
 from app.drivers import get_driver
 from app.models import Role
 from app.services.deployments import drain_launches
-from tests.conftest import deploy_undersized, pump, register_fleet, set_role
+from tests.conftest import deploy_that_fails, pump, register_fleet, set_role
 
 
 # ------------------------------------------------------------------- planning
@@ -229,22 +229,47 @@ async def test_a_healthy_deployment_is_not_nagged_about_loading_weights(client):
     assert [f for f in body["findings"] if f["severity"] == "info"] == []
 
 
-async def test_a_model_that_does_not_fit_fails_with_a_cause_and_a_fix(client):
-    """The end-to-end diagnostic path: oversized model -> OOM in the container
-    -> failed status -> a finding that names the fix."""
-    ids = await register_fleet(["rtx-ws-01"])
-    dep = await deploy_undersized(client, ids["rtx-ws-01"], [0, 1])
-    await pump()
+async def test_a_model_too_big_for_the_hardware_is_refused_not_launched(client):
+    """The failure this exists to prevent. vLLM asked for more memory than the
+    card has does not fail politely — it takes the node down with it, and a
+    wedged DGX is a trip to the machine room."""
+    ids = await register_fleet(["rtx-ws-01"])       # 2x 48 GiB
+    r = await client.post("/api/deployments", json={
+        "hf_repo": "meta-llama/Llama-3.3-70B-Instruct", "served_model_name": "too-big",
+        "tensor_parallel_size": 1,
+        "targets": [{"node_id": ids["rtx-ws-01"], "gpu_indices": [0]}],
+    })
+    assert r.status_code == 409
+    assert (await client.get("/api/deployments")).json() == [], "nothing may be claimed"
 
-    after = (await client.get(f"/api/deployments/{dep['id']}")).json()
-    assert after["status"] == "failed"
-    assert "exited" in after["status_reason"]
 
-    body = (await client.get(f"/api/deployments/{dep['id']}/logs")).json()
-    oom = next(f for f in body["findings"] if f["code"] == "cuda_oom")
-    assert oom["severity"] == "error"
-    assert "tensor-parallel" in oom["fix"]
-    assert "OutOfMemoryError" in oom["evidence"]
+async def test_a_catalog_entry_that_understates_a_model_cannot_get_through(client):
+    """The catalog is hand-maintained, so its numbers are a floor rather than a
+    fact: a 70B model with 10 written against it must not be placed on a card
+    that cannot hold it."""
+    await register_fleet(["rtx-ws-01"])
+    await client.post("/api/catalog", json={
+        "key": "mis-sized", "display_name": "Mis-sized 70B",
+        "hf_repo": "meta-llama/Llama-3.3-70B-Instruct",
+        "params_b": 70, "min_gpu_memory_gb": 10, "recommended_tp": 1,
+    })
+    r = await client.post("/api/deployments", json={"spec_key": "mis-sized", "replicas": 1})
+    assert r.status_code == 409
+    assert "needs at least" in r.json()["detail"]
+
+
+async def test_a_refusal_says_what_would_work(client):
+    """A dead end is not an answer. Every suggestion is checked against the
+    hardware actually present before it is offered."""
+    await register_fleet(["dgx-01"])
+    r = await client.post("/api/deployments", json={
+        "hf_repo": "meta-llama/Llama-3.3-70B-Instruct", "served_model_name": "big",
+        "tensor_parallel_size": 1, "replicas": 1,
+    })
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert "Try:" in detail
+    assert "tensor-parallel" in detail or "max-model-len" in detail or "build of this model" in detail
 
 
 async def test_a_failed_deployment_gives_its_gpus_back(client):

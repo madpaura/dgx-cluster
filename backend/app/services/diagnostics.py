@@ -123,6 +123,26 @@ RULES: list[_Rule] = [
         ["edit-catalog"],
     ),
     _Rule(
+        "image_missing",
+        re.compile(r"manifest (unknown|for .* not found)|repository .* not found|"
+                   r"pull access denied|no such image", re.I),
+        "error", "The container image could not be pulled",
+        "The node asked the registry for this image and was refused or told it does not exist.",
+        "Check the image tag for a typo. If it is a private registry, make sure the node is "
+        "logged in to it — dgxctl uses the node's own docker credentials.",
+        ["edit-args"],
+    ),
+    _Rule(
+        "registry_unreachable",
+        re.compile(r"TLS handshake timeout|failed to resolve reference|dial tcp|"
+                   r"i/o timeout|proxyconnect tcp", re.I),
+        "error", "The node cannot reach the image registry",
+        "The pull failed at the network level rather than being refused.",
+        "Check the node's DNS and outbound access, or mirror the image into a registry it "
+        "can reach and point the catalog entry at that.",
+        ["node-health"],
+    ),
+    _Rule(
         "download_slow", re.compile(r"Loading safetensors checkpoint shards", re.I),
         "info", "Downloading / loading weights",
         "Weights are still being fetched or loaded into VRAM. Large models can take many minutes on first run.",

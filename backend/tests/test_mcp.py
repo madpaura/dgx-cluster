@@ -17,7 +17,7 @@ from app.main import app
 from app.mcp_server import AGENT_EMAIL, build_mcp_app, mcp
 from app.services.deployments import drain_launches
 from app.services.deployments import drain_launches
-from tests.conftest import deploy_undersized, pump, register_fleet
+from tests.conftest import deploy_that_fails, pump, register_fleet
 
 HDRS = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
 
@@ -214,14 +214,13 @@ async def test_events_are_readable_and_filterable(agent, client):
 async def test_logs_come_back_diagnosed_with_a_fix(agent, client):
     """An agent must not have to parse a vLLM traceback."""
     ids = await register_fleet(["rtx-ws-01"])
-    dep = await deploy_undersized(client, ids["rtx-ws-01"], [0, 1])
+    dep = await deploy_that_fails(client, ids["rtx-ws-01"], [0, 1])
     await pump()
 
     body = await agent.call("deployment_logs", deployment_id=dep["id"])
-    oom = next(f for f in body["findings"] if f["severity"] == "error")
-    assert "does not fit" in oom["problem"]
-    assert "tensor-parallel" in oom["fix"]
-    assert "OutOfMemoryError" in oom["evidence"]
+    finding = next(f for f in body["findings"] if f["severity"] == "error")
+    assert "image could not be pulled" in finding["problem"]
+    assert "typo" in finding["fix"]
 
 
 async def test_node_diagnosis_explains_unreachability(agent, client):

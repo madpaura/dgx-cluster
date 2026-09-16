@@ -13,13 +13,13 @@ from ..models import (
     ACTIVE_STATUSES, Deployment, DeployStatus, MetricSample, ModelSpec, Node, Role, Team, User,
 )
 from ..schemas import (
-    BulkAction, CheckOut, DeploymentOut, DeployRequest, EstimateOut, FindingOut, LogsOut,
+    BulkAction, CheckOut, OptionOut, DeploymentOut, DeployRequest, EstimateOut, FindingOut, LogsOut,
     PlacementOut, PlanOut, RejectionOut, SeriesOut, SeriesPoint,
 )
 from ..services import deployments as deploy_svc
 from ..services import diagnostics
-from ..services import sizing
-from ..services.capacity import node_capacity_now
+from ..services import sizing, vllm_args
+from ..services.capacity import node_capacity, node_capacity_now
 from ..services.placement import plan as plan_placements
 
 router = APIRouter(prefix="/api/deployments", tags=["deployments"])
@@ -30,6 +30,19 @@ router = APIRouter(prefix="/api/deployments", tags=["deployments"])
 # of it. The bound exists to stop a livelock on a genuinely full fleet, not to
 # ration attempts; exhausting it returns a 409 that is safe to retry.
 PLACEMENT_RETRIES = 10
+
+
+def _best_available(nodes, tp: int) -> tuple[float, int]:
+    """The roomiest GPU anywhere the caller could use, and how many GPUs sit
+    beside it — what any recommendation has to fit into."""
+    best_gb, gpus_there = 0.0, 0
+    for node in nodes:
+        if not node.schedulable or len(node.gpus) < tp:
+            continue
+        free = max(node_capacity(node).values(), default=0) / 1024
+        if free > best_gb:
+            best_gb, gpus_there = free, len(node.gpus)
+    return best_gb, gpus_there
 
 
 def to_out(dep: Deployment) -> DeploymentOut:
@@ -87,6 +100,28 @@ async def list_deployments(
     return [to_out(d) for d in rows.scalars().unique()]
 
 
+async def _requirement(db: AsyncSession, body: DeployRequest, spec, hf_repo: str,
+                       tp: int, max_len: int, nodes) -> tuple[float, sizing.Assessment]:
+    """How much VRAM per GPU this actually needs, and why.
+
+    The catalog number is an operator's measurement and a useful floor, but on
+    its own it is a hand-typed figure that nothing checks: a 70B model with 10
+    written against it would be placed on a card that cannot hold it, and vLLM
+    would take the node down with it. The larger of the two wins, so a wrong
+    catalog entry can be conservative but never dangerous.
+    """
+    assessment = await _assess(db, body, spec, hf_repo, tp, max_len, nodes, [])
+    catalog_gb = (spec.min_gpu_memory_gb if spec else 0.0) or 0.0
+
+    # The floor, not the comfortable size. vLLM sizes its KV cache to whatever
+    # memory it is given, so the question that decides yes or no is whether it
+    # can start at all: weights, one full-length sequence, and overhead. Gating
+    # on the roomier figure would refuse deployments that run perfectly well,
+    # just with less concurrency.
+    floor = assessment.estimate.minimum_gb_per_gpu
+    return max(catalog_gb, floor), assessment
+
+
 async def _assess(db: AsyncSession, body: DeployRequest, spec, hf_repo: str, tp: int,
                   max_len: int, nodes, placements) -> sizing.Assessment:
     """Size the model and check the settings against what it declares.
@@ -132,6 +167,7 @@ async def plan_deployment(
     if body.node_ids:
         nodes = [n for n in nodes if n.id in set(body.node_ids)]
 
+    per_gpu_gb, assessment = await _requirement(db, body, spec, hf_repo, tp, max_len, nodes)
     placements, rejections = plan_placements(nodes, per_gpu_gb=per_gpu_gb, tp=tp)
 
     # Show the command that would actually run, which means deriving the memory
@@ -153,12 +189,30 @@ async def plan_deployment(
         revision=spec.revision if spec else "",
         extra_args={**(spec.extra_args if spec else {}), **body.extra_args},
     )
-    assessment = await _assess(db, body, spec, hf_repo, tp, max_len, nodes, placements)
+    checks = list(assessment.checks)
+    checks += [
+        sizing.Check(i.severity, i.title, i.detail, i.fix)
+        for i in vllm_args.validate({**(spec.extra_args if spec else {}), **body.extra_args})
+    ]
+    blocked = any(c.severity == "error" for c in checks)
+
+    options: list[sizing.Option] = []
+    if not placements:
+        free_gb, gpus_there = _best_available(nodes, tp)
+        options = sizing.recommend(
+            assessment.estimate,
+            config=await sizing.fetch_config(hf_repo, spec.revision if spec else "",
+                                             settings.hf_token),
+            largest_free_gb=free_gb,
+            gpus_on_best_node=gpus_there,
+            quantization=body.quantization or (spec.quantization if spec else ""),
+        )
 
     return PlanOut(
         estimate=EstimateOut(**assessment.estimate.__dict__),
-        checks=[CheckOut(**c.__dict__) for c in assessment.checks],
-        blocked=bool(assessment.blocking),
+        checks=[CheckOut(**c.__dict__) for c in checks],
+        options=[OptionOut(**o.__dict__) for o in options],
+        blocked=blocked,
         placements=[
             PlacementOut(
                 node_id=p.node_id, node_name=p.node_name, gpu_indices=p.gpu_indices,
@@ -201,11 +255,39 @@ async def create_deployment(
     candidates = list(rows.scalars().unique())
     if body.node_ids:
         candidates = [n for n in candidates if n.id in set(body.node_ids)]
-    preview, _ = plan_placements(candidates, per_gpu_gb=per_gpu_gb, tp=tp)
-    assessment = await _assess(db, body, spec, hf_repo, tp, max_len, candidates, preview)
+    per_gpu_gb, assessment = await _requirement(db, body, spec, hf_repo, tp, max_len, candidates)
+
+    bad_args = [i for i in vllm_args.validate({**(spec.extra_args if spec else {}), **body.extra_args})
+                if i.severity == "error"]
+    if bad_args:
+        raise HTTPException(422, f"{bad_args[0].title}: {bad_args[0].detail} {bad_args[0].fix}")
     if assessment.blocking:
         first = assessment.blocking[0]
         raise HTTPException(422, f"{first.title}: {first.detail} {first.fix}")
+
+    preview, why_not = plan_placements(candidates, per_gpu_gb=per_gpu_gb, tp=tp)
+    if not preview and why_not and not any("GiB" in r.reason for r in why_not):
+        # Drained, unreachable, too few GPUs: the node said no for a reason of
+        # its own, and repeating a memory figure would bury it.
+        raise HTTPException(409, "; ".join(f"{r.node_name}: {r.reason}" for r in why_not[:4]))
+    if not preview:
+        # Refusing is the point. vLLM asked for more than the card has does not
+        # fail politely — it takes the node down with it.
+        free_gb, gpus_there = _best_available(candidates, tp)
+        options = sizing.recommend(
+            assessment.estimate,
+            config=await sizing.fetch_config(hf_repo, spec.revision if spec else "",
+                                             settings.hf_token),
+            largest_free_gb=free_gb, gpus_on_best_node=gpus_there,
+            quantization=body.quantization or (spec.quantization if spec else ""),
+        )
+        advice = ("; ".join(f"{o.change} would need {o.needs_gb_per_gpu} GiB" for o in options)
+                  or "free capacity, or use a smaller model")
+        raise HTTPException(
+            409,
+            f"{hf_repo} needs at least {per_gpu_gb:.0f} GiB per GPU to start at these "
+            f"settings, and the largest free GPU has {free_gb:.0f} GiB. Try: {advice}.",
+        )
 
     # Read off the ORM object once. Rolling back a lost race expires every
     # instance in the session, and touching an expired attribute afterwards is

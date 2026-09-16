@@ -159,21 +159,18 @@ async def set_role(role: Role, team_id: str | None = None) -> None:
         await session.commit()
 
 
-async def deploy_undersized(client, node_id: str, gpu_indices: list[int]) -> dict:
-    """Deploy a model whose catalog entry understates what it needs.
+async def deploy_that_fails(client, node_id: str, gpu_indices: list[int]) -> dict:
+    """Get a deployment into `failed` by way of a real runtime error.
 
-    Placement believes it fits and reserves the stated share; the container then
-    runs out of memory on the node. That is the failure the diagnostics engine
-    exists for, and the only way a model still OOMs now that capacity is checked
-    before launch — a wrong number in the catalog.
+    An image tag that does not exist: accepted by every pre-flight check, since
+    nothing can know it is wrong until the node asks the registry. A mis-sized
+    model no longer works for this — it is refused before launch, which is the
+    whole point of checking capacity against the measured requirement.
     """
-    await client.post("/api/catalog", json={
-        "key": "mis-sized", "display_name": "Mis-sized 70B",
-        "hf_repo": "meta-llama/Llama-3.3-70B-Instruct",
-        "params_b": 70, "min_gpu_memory_gb": 10, "recommended_tp": 2,
-    })
     r = await client.post("/api/deployments", json={
-        "spec_key": "mis-sized",
+        "spec_key": "llama3.1-8b",
+        "served_model_name": "doomed",
+        "image": "vllm/vllm-openai:missing",
         "targets": [{"node_id": node_id, "gpu_indices": gpu_indices}],
     })
     await drain_launches()

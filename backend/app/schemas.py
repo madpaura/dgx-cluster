@@ -260,6 +260,12 @@ class CheckOut(BaseModel):
     fix: str
 
 
+class OptionOut(BaseModel):
+    change: str
+    needs_gb_per_gpu: float
+    detail: str
+
+
 class PlanOut(BaseModel):
     placements: list[PlacementOut]
     rejections: list[RejectionOut]
@@ -268,6 +274,7 @@ class PlanOut(BaseModel):
     argv: list[str]
     estimate: EstimateOut | None = None
     checks: list[CheckOut] = []
+    options: list[OptionOut] = []
     blocked: bool = False
 
 

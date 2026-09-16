@@ -21,6 +21,10 @@ CASES = [
     ("ValueError: Unknown quantization method: awq2", "quantization"),
     ("vllm.engine.async_llm_engine.AsyncEngineDeadError: Background loop has errored", "engine_dead"),
     ("ValueError: Model architectures ['FooForCausalLM'] are not supported for now", "arch_unsupported"),
+    ("Error response from daemon: manifest for vllm/vllm-openai:0.0.0 not found: "
+     "manifest unknown", "image_missing"),
+    ("Error response from daemon: Get https://registry-1.docker.io/v2/: "
+     "net/http: TLS handshake timeout", "registry_unreachable"),
 ]
 
 
