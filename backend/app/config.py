@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     # server reaches it, which inside Docker is a name only other containers
     # resolve — following that link from a laptop goes nowhere.
     litellm_public_url: str = ""
+    # The port a browser reaches the proxy on — the published one, which need
+    # not match the container's. Used to build a link when no explicit public
+    # URL is set.
+    litellm_public_port: int = 4000
 
     # --- auth ---
     # "dev" bypasses OIDC and logs everyone in as admin. Use only locally.

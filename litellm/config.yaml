@@ -16,9 +16,26 @@ litellm_settings:
   num_retries: 1
   request_timeout: 600
   telemetry: false
+  # Response caching is deliberately OFF. Redis here is for router state, not
+  # for serving a previous answer to an identical prompt: on an inference
+  # gateway that surprises people, and a sampled model is expected to vary.
+  # Turn it on per deployment if you know you want it:
+  #   cache: true
+  #   cache_params: { type: redis, ttl: 600 }
+
+  # Per-request logging is the largest avoidable cost at high request rates;
+  # spend tracking and the request log are unaffected.
+  set_verbose: false
+  json_logs: true
 
 router_settings:
   routing_strategy: least-busy
   # A replica that errors is parked briefly rather than kept in rotation.
   allowed_fails: 3
   cooldown_time: 30
+  # Router state in Redis rather than per-worker memory. Without it, four
+  # workers each balance over their own quarter of the traffic and keep their
+  # own cooldown list, so "least busy" is measured against a fraction of what is
+  # actually happening and a dead replica is parked four separate times.
+  redis_host: os.environ/REDIS_HOST
+  redis_port: os.environ/REDIS_PORT

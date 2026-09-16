@@ -326,3 +326,49 @@ async def test_the_periodic_pass_is_silent_when_nothing_changes(client, proxy):
     async with SessionLocal() as s:
         await worker.litellm_pass(s)
     assert len((await client.get("/api/events")).json()) == before
+
+
+# ---------------------------------------------------------- the console link
+
+async def test_the_console_link_follows_the_host_you_reached_dgxctl_on(client, proxy, monkeypatch):
+    """Hardcoding localhost only works for someone sitting at the server."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "litellm_public_url", "")
+    monkeypatch.setattr(settings, "litellm_public_port", 4000)
+
+    s = (await client.get("/api/litellm/status", headers={"host": "dgxctl.office.lan:8080"})).json()
+    assert s["console_url"] == "http://dgxctl.office.lan:4000/ui/"
+
+
+async def test_a_non_default_published_port_is_used(client, proxy, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "litellm_public_url", "")
+    monkeypatch.setattr(settings, "litellm_public_port", 4400)
+
+    s = (await client.get("/api/litellm/status", headers={"host": "gpu-01:9000"})).json()
+    assert s["console_url"] == "http://gpu-01:4400/ui/"
+
+
+async def test_an_explicit_public_url_wins(client, proxy, monkeypatch):
+    """Behind a reverse proxy the port is not the whole story, so the operator
+    can say exactly where it lives."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "litellm_public_url", "https://llm.corp.example/proxy")
+    s = (await client.get("/api/litellm/status", headers={"host": "dgxctl.office.lan"})).json()
+    assert s["console_url"] == "https://llm.corp.example/proxy/ui/"
+
+
+async def test_a_forwarded_host_is_honoured(client, proxy, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "litellm_public_url", "")
+    monkeypatch.setattr(settings, "litellm_public_port", 4000)
+    s = (await client.get("/api/litellm/status", headers={
+        "host": "internal:8000",
+        "x-forwarded-host": "dgx.example.com",
+        "x-forwarded-proto": "https",
+    })).json()
+    assert s["console_url"] == "https://dgx.example.com:4000/ui/"

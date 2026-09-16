@@ -109,6 +109,19 @@ classifies exactly as it would in production.
 One environment variable switches to the real fleet. Nothing above the driver
 layer knows the difference.
 
+## Redis is for router state, not for caching answers
+
+LiteLLM runs four workers. Without shared state each of them keeps its own idea
+of which replica is busy and which is in cooldown, so `least-busy` routing
+balances over a quarter of the traffic and a failing replica has to earn its
+`allowed_fails` four separate times before every worker parks it. Redis makes
+that state common; you can watch it work in the `global_router:*:rpm:*` keys.
+
+Response caching is deliberately left off. Returning a previous answer to an
+identical prompt surprises people on an inference gateway, and a sampled model
+is expected to vary between calls. The config says how to turn it on for a
+deployment that genuinely wants it.
+
 ## LiteLLM gets its own database
 
 Both services use the same Postgres instance but **different databases**, and

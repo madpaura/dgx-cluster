@@ -54,7 +54,10 @@ services:
       DGXCTL_HF_TOKEN: ${DGXCTL_HF_TOKEN:-}
       DGXCTL_LITELLM_BASE_URL: http://litellm:4000
       DGXCTL_LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
-      DGXCTL_LITELLM_PUBLIC_URL: ${DGXCTL_LITELLM_PUBLIC_URL:-http://localhost:${LITELLM_PORT:-4000}}
+      DGXCTL_LITELLM_PUBLIC_URL: ${DGXCTL_LITELLM_PUBLIC_URL:-}
+      # The port a browser uses, which is the published one rather than the
+      # container's. Only consulted when no explicit public URL is set.
+      DGXCTL_LITELLM_PUBLIC_PORT: ${LITELLM_PORT:-4000}
       DGXCTL_AUTH_MODE: ${DGXCTL_AUTH_MODE:-dev}
       DGXCTL_MCP_ENABLED: ${DGXCTL_MCP_ENABLED:-true}
       DGXCTL_MCP_TOKEN: ${DGXCTL_MCP_TOKEN:-}
@@ -92,10 +95,40 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Shared state for the LiteLLM router. With more than one worker — and there
+  # are four — each worker otherwise keeps its own idea of which replica is busy
+  # and which is in cooldown, so least-busy routing balances over a quarter of
+  # the traffic and a dead replica collects four times the failures before every
+  # worker parks it.
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 320m
+    cpus: "0.5"
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    restart: unless-stopped
+
   litellm:
     image: ghcr.io/berriai/litellm:main-stable
     depends_on:
       postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
       LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:-${LITELLM_MASTER_KEY}}
@@ -103,6 +136,8 @@ services:
       # schema it migrates, so sharing one destroys the fleet inventory.
       DATABASE_URL: postgresql://dgxctl:${POSTGRES_PASSWORD:-dgxctl}@postgres:5432/litellm
       STORE_MODEL_IN_DB: "True"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
     volumes:
       - ./litellm/config.yaml:/app/config.yaml:ro
     command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "4"]

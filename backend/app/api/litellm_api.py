@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,14 +19,14 @@ class TestRequest(BaseModel):
 
 
 @router.get("/status")
-async def status(_: User = Depends(current_user)):
+async def status(request: Request, _: User = Depends(current_user)):
     client = LiteLLMClient()
     try:
         health = await client.health()
         groups = await client.groups() if health["reachable"] else []
         return {
             "base_url": settings.litellm_base_url,
-            "console_url": _console_url(),
+            "console_url": _console_url(request),
             "auto_register": settings.litellm_auto_register,
             "reachable": health["reachable"],
             "detail": health["detail"],
@@ -37,7 +37,7 @@ async def status(_: User = Depends(current_user)):
 
 
 @router.get("/metrics")
-async def metrics(_: User = Depends(current_user)):
+async def metrics(request: Request, _: User = Depends(current_user)):
     """What the proxy itself reports: which backends it can reach, and the
     traffic that has gone through it.
 
@@ -52,7 +52,7 @@ async def metrics(_: User = Depends(current_user)):
             return {"reachable": False, "error": str(exc), "backends": None, "traffic": None}
         return {
             "reachable": True,
-            "console_url": _console_url(),
+            "console_url": _console_url(request),
             "backends": backends,
             "traffic": await client.recent_traffic(),
         }
@@ -60,11 +60,21 @@ async def metrics(_: User = Depends(current_user)):
         await client.close()
 
 
-def _console_url() -> str:
-    """Where to send a browser. Falls back to the internal address, which is
-    right when dgxctl and the proxy are not in separate containers."""
-    base = (settings.litellm_public_url or settings.litellm_base_url).rstrip("/")
-    return f"{base}/ui/"
+def _console_url(request: Request) -> str:
+    """Where to send a browser.
+
+    An explicit public URL wins. Otherwise the link is built from the host the
+    caller reached dgxctl on, because that is demonstrably a name their browser
+    resolves — hardcoding localhost only works for someone sitting at the
+    server, and litellm_base_url is a container name that resolves nowhere else.
+    """
+    if settings.litellm_public_url:
+        return settings.litellm_public_url.rstrip("/") + "/ui/"
+
+    host = (request.headers.get("x-forwarded-host") or request.url.hostname or "localhost")
+    host = host.split(":")[0]
+    scheme = request.headers.get("x-forwarded-proto") or request.url.scheme or "http"
+    return f"{scheme}://{host}:{settings.litellm_public_port}/ui/"
 
 
 @router.post("/test")
