@@ -357,8 +357,11 @@ class LLMSettingsIn(BaseModel):
     # Blank means the fleet's own LiteLLM proxy — no external account needed.
     base_url: str = ""
     model: str = ""
-    # Write-only. Send "" to leave the stored key alone; send null to clear it.
-    api_key: str | None = None
+    # Write-only, and it defaults to "" rather than None so that *omitting* the
+    # field keeps the stored key. A script that PUTs {enabled, model} to flip a
+    # setting must not wipe a credential it never mentioned; clearing has to be
+    # asked for, by sending null explicitly.
+    api_key: str | None = ""
     timeout_s: float = Field(60.0, ge=5, le=600)
     max_input_chars: int = Field(24000, ge=1000, le=200000)
 

@@ -144,3 +144,13 @@ async def test_the_test_button_reports_a_failure_instead_of_erroring(client):
     assert r.status_code == 200
     assert r.json()["ok"] is False
     assert r.json()["detail"]
+
+
+async def test_a_put_that_omits_the_key_entirely_keeps_it(client):
+    """Changing one setting from a script must not wipe a credential the
+    request never mentioned. Only an explicit null clears it."""
+    await configure(client)
+    r = await client.put("/api/settings/llm", json={"enabled": True, "model": "gpt-oss"})
+    assert r.status_code == 200, r.text
+    assert r.json()["has_api_key"] is True
+    assert r.json()["api_key_hint"] == "…1234"
