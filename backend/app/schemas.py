@@ -348,3 +348,59 @@ class SeriesOut(BaseModel):
     scope: str
     scope_id: str
     points: list[SeriesPoint]
+
+
+# ------------------------------------------------------- portal LLM settings
+
+class LLMSettingsIn(BaseModel):
+    enabled: bool = False
+    # Blank means the fleet's own LiteLLM proxy — no external account needed.
+    base_url: str = ""
+    model: str = ""
+    # Write-only. Send "" to leave the stored key alone; send null to clear it.
+    api_key: str | None = None
+    timeout_s: float = Field(60.0, ge=5, le=600)
+    max_input_chars: int = Field(24000, ge=1000, le=200000)
+
+
+class LLMSettingsOut(BaseModel):
+    enabled: bool
+    base_url: str
+    model: str
+    timeout_s: float
+    max_input_chars: int
+    # The key itself never leaves the server; this is enough to see it is set.
+    has_api_key: bool
+    api_key_hint: str = ""
+    effective_base_url: str
+    updated_at: datetime | None = None
+    updated_by: str = ""
+
+
+class LLMTestOut(BaseModel):
+    ok: bool
+    detail: str
+    model: str = ""
+
+
+class CatalogImportIn(BaseModel):
+    url: str
+
+
+class CatalogDraftOut(BaseModel):
+    key: str
+    display_name: str
+    hf_repo: str
+    revision: str = ""
+    params_b: float
+    quantization: str
+    min_gpu_memory_gb: float
+    recommended_tp: int
+    max_model_len: int
+    extra_args: dict
+    vllm_image: str = ""
+    tags: list[str]
+    notes: str
+    source_url: str
+    sizing_source: str
+    warnings: list[str]

@@ -32,7 +32,9 @@ from .config import settings
 from .db import SessionLocal
 from .auth import upsert_user
 from .models import Role
-from .schemas import ClusterCreate, DeployRequest, NodeCreate, NodeMove
+from .schemas import (
+    CatalogImportIn, ClusterCreate, DeployRequest, ModelSpecIn, NodeCreate, NodeMove,
+)
 
 log = logging.getLogger(__name__)
 
@@ -250,6 +252,62 @@ async def list_catalog() -> dict:
          "vram_gb_per_gpu": s.min_gpu_memory_gb, "tensor_parallel": s.recommended_tp,
          "tags": s.tags, "notes": s.notes or None}
         for s in specs]}
+
+
+@mcp.tool(description="Read a Hugging Face or GitHub model page and draft a catalog "
+                      "entry from it. Returns the draft WITHOUT saving: show it to "
+                      "the operator, then call add_catalog_entry to keep it. Needs a "
+                      "drafting model configured under Settings.")
+async def draft_catalog_entry(url: str) -> dict:
+    async with _ctx() as (db, user):
+        try:
+            draft = await catalog_api.import_from_url(
+                body=CatalogImportIn(url=url), db=db, user=user
+            )
+        except HTTPException as exc:
+            raise _fail(exc) from exc
+    out = draft.model_dump()
+    out["saved"] = False
+    out["next_step"] = (
+        "Nothing has been saved. Show these fields to the operator, apply any "
+        "corrections they ask for, then call add_catalog_entry."
+    )
+    return out
+
+
+@mcp.tool(description="Save a catalog entry. Use it to keep a draft from "
+                      "draft_catalog_entry after the operator has checked it, or to "
+                      "add one from scratch. `key` must be unique.")
+async def add_catalog_entry(
+    key: str,
+    display_name: str,
+    hf_repo: str,
+    min_gpu_memory_gb: float,
+    recommended_tp: int = 1,
+    params_b: float = 0.0,
+    quantization: str = "",
+    max_model_len: int = 0,
+    extra_args: dict | None = None,
+    vllm_image: str = "",
+    tags: list[str] | None = None,
+    notes: str = "",
+    revision: str = "",
+) -> dict:
+    async with _ctx() as (db, user):
+        try:
+            spec = await catalog_api.create_spec(
+                body=ModelSpecIn(
+                    key=key, display_name=display_name, hf_repo=hf_repo, revision=revision,
+                    params_b=params_b, quantization=quantization,
+                    min_gpu_memory_gb=min_gpu_memory_gb, recommended_tp=recommended_tp,
+                    max_model_len=max_model_len, extra_args=extra_args or {},
+                    vllm_image=vllm_image, tags=tags or [], notes=notes,
+                ),
+                db=db, user=user,
+            )
+        except HTTPException as exc:
+            raise _fail(exc) from exc
+    return {"saved": True, "key": spec.key, "id": spec.id, "name": spec.display_name}
 
 
 @mcp.tool(description="Operator-defined node groupings, with how many nodes each "

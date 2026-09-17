@@ -97,3 +97,57 @@ async def test_catalog_edits_need_deployer(client):
     r = await client.post("/api/catalog", json={"key": "x", "display_name": "X", "hf_repo": "a/b"})
     assert r.status_code == 403
     assert (await client.get("/api/catalog")).status_code == 200
+
+
+async def test_deleting_an_entry_that_is_still_deployed_says_where(client):
+    """Deployments carry a foreign key back to the entry they came from. Left
+    alone that turns a delete into a 500; what an operator needs is the name of
+    the box still running it."""
+    from tests.conftest import register_fleet
+
+    await register_fleet(["dgx-01"])
+    spec = (await client.post("/api/catalog", json={
+        "key": "still-running", "display_name": "Still Running", "hf_repo": "org/m",
+        "params_b": 1, "min_gpu_memory_gb": 4, "recommended_tp": 1,
+    })).json()
+    assert (await client.post("/api/deployments", json={
+        "spec_key": "still-running", "replicas": 1})).status_code == 201
+
+    r = await client.delete(f"/api/catalog/{spec['id']}")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert "dgx-01" in detail and "Stop those deployments first" in detail
+    assert len((await client.get("/api/catalog")).json()) > 0
+
+
+async def test_a_finished_deployment_does_not_block_the_delete(client, db):
+    """History keeps its own repo and model name, so the entry can go."""
+    from sqlalchemy import select
+
+    from app.models import Deployment, DeployStatus
+    from app.services.deployments import drain_launches
+    from tests.conftest import register_fleet
+
+    await register_fleet(["dgx-01"])
+    spec = (await client.post("/api/catalog", json={
+        "key": "finished", "display_name": "Finished", "hf_repo": "org/m",
+        "params_b": 1, "min_gpu_memory_gb": 4, "recommended_tp": 1,
+    })).json()
+    dep = (await client.post("/api/deployments", json={
+        "spec_key": "finished", "replicas": 1})).json()[0]
+
+    # Let the background launch finish first, or it writes the status back
+    # underneath us and the entry still looks live.
+    await drain_launches()
+    row = await db.get(Deployment, dep["id"])
+    await db.refresh(row)
+    row.status = DeployStatus.stopped
+    await db.commit()
+
+    assert (await client.delete(f"/api/catalog/{spec['id']}")).status_code == 204
+
+    # The deployment survives, detached rather than deleted.
+    kept = (await db.execute(select(Deployment).where(Deployment.id == dep["id"]))).scalar_one()
+    await db.refresh(kept)
+    assert kept.spec_id is None
+    assert kept.hf_repo == "org/m"

@@ -160,7 +160,15 @@ export interface Plan {
   argv: string[];
   estimate: Estimate | null;
   checks: Check[];
+  options: SizingOption[];
   blocked: boolean;
+}
+
+/** A change that would make the model fit — produced by sizing.recommend(). */
+export interface SizingOption {
+  change: string;
+  needs_gb_per_gpu: number;
+  detail: string;
 }
 
 export interface Finding {
@@ -243,4 +251,44 @@ export interface RuntimeConfig {
   vllm_image: string;
   litellm_base_url: string;
   poll_seconds: number;
+}
+
+export interface LLMSettings {
+  enabled: boolean;
+  base_url: string;
+  model: string;
+  timeout_s: number;
+  max_input_chars: number;
+  has_api_key: boolean;
+  api_key_hint: string;
+  effective_base_url: string;
+  updated_at: string | null;
+  updated_by: string;
+}
+
+export interface LLMTestResult {
+  ok: boolean;
+  detail: string;
+  model: string;
+}
+
+/** A proposed catalog entry from Catalog → Import from URL. Never saved until
+ *  the operator presses Save. */
+export interface CatalogDraft {
+  key: string;
+  display_name: string;
+  hf_repo: string;
+  revision: string;
+  params_b: number;
+  quantization: string;
+  min_gpu_memory_gb: number;
+  recommended_tp: number;
+  max_model_len: number;
+  extra_args: Record<string, unknown>;
+  vllm_image: string;
+  tags: string[];
+  notes: string;
+  source_url: string;
+  sizing_source: string;
+  warnings: string[];
 }

@@ -15,7 +15,9 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from . import worker
 from .mcp_server import build_mcp_app, mcp
-from .api import auth_api, catalog, clusters, deployments, fleet, litellm_api, nodes
+from .api import (
+    auth_api, catalog, clusters, deployments, fleet, litellm_api, nodes, settings_api,
+)
 from .config import settings
 from .db import SessionLocal, init_db
 from .drivers import close_driver
@@ -118,7 +120,7 @@ app.add_middleware(
 
 for r in (
     auth_api.router, fleet.router, clusters.router, nodes.router,
-    deployments.router, catalog.router, litellm_api.router,
+    deployments.router, catalog.router, litellm_api.router, settings_api.router,
 ):
     app.include_router(r)
 

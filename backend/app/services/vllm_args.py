@@ -15,20 +15,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Flags dgxctl derives itself, and the field that should be used instead.
+# Flags dgxctl derives itself, mapped to the whole sentence telling you what to
+# do instead. A full sentence rather than a field name because the reasons differ
+# in shape: some point at a form field, some explain why the flag is not yours to
+# set — and "Remove it and use dgxctl allocates the port" helps nobody.
 MANAGED: dict[str, str] = {
-    "--model": "the model / hf_repo field",
-    "--served-model-name": "the 'served as' field",
-    "--host": "dgxctl always binds the container's own interface",
-    "--port": "dgxctl allocates the port",
-    "--tensor-parallel-size": "the tensor-parallel field",
+    "--model": "Set the model in the model / Hugging Face repo field instead.",
+    "--served-model-name": "Set it in the 'served as' field instead.",
+    "--host": "Remove it — dgxctl always binds the container's own interface.",
+    "--port": "Remove it — dgxctl allocates the port, and a fixed one collides "
+              "with the next model on the same node.",
+    "--tensor-parallel-size": "Set it in the tensor-parallel field instead.",
     "--gpu-memory-utilization": (
-        "the memory share is derived from the reservation, so several models "
-        "can share a GPU; setting it by hand is how a card gets oversubscribed"
+        "Remove it. The memory share is derived from the reservation, which is "
+        "what lets several models share a GPU; setting it by hand is how a card "
+        "gets oversubscribed and the node goes down."
     ),
-    "--max-model-len": "the max model len field",
-    "--quantization": "the quantization field",
-    "--revision": "the catalog entry's revision",
+    "--max-model-len": "Set it in the max model len field instead.",
+    "--quantization": "Set it in the quantization field instead.",
+    "--revision": "Set it in the catalog entry's revision field instead.",
 }
 
 # name -> value kind. "flag" takes no value.
@@ -148,8 +153,8 @@ def validate(extra_args: dict) -> list[ArgIssue]:
         if name in MANAGED:
             issues.append(ArgIssue(
                 "error", f"{name} is set by dgxctl",
-                f"Passing it here conflicts with the value dgxctl computes.",
-                f"Remove it and use {MANAGED[name]}.",
+                "Passing it here conflicts with the value dgxctl computes.",
+                MANAGED[name],
             ))
             continue
 
@@ -159,8 +164,8 @@ def validate(extra_args: dict) -> list[ArgIssue]:
                 "warning", f"{name} is not a flag dgxctl recognises",
                 "It may be valid in your vLLM version, or it may be a typo. "
                 "vLLM exits on an unknown argument, several minutes into loading.",
-                f"Check it against `vllm serve --help` for {'' or 'your image'}. "
-                f"Leave it if you are sure.",
+                "Check it against `vllm serve --help` for your image. "
+                "Leave it if you are sure.",
             ))
             continue
 

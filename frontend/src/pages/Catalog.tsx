@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { parseFlags } from "../lib/flags";
+import { ImportDialog } from "../components/ImportDialog";
 import { Confirm, Modal, Pill, useToast } from "../components/ui";
 import { api, ApiError, usePolled } from "../lib/api";
 import type { Me, ModelSpec } from "../types";
@@ -24,18 +26,33 @@ const BLANK = {
 export function Catalog({ me }: { me: Me | null }) {
   const { data: specs, refresh } = usePolled<ModelSpec[]>("/api/catalog", 30000);
   const [editing, setEditing] = useState<(typeof BLANK & { id?: string }) | null>(null);
+  // The flags box holds text, not the parsed object: you have to be able to type
+  // a half-finished `{"--x":` without the field fighting you or the value being lost.
+  const [flagsText, setFlagsText] = useState("{}");
   const [deleting, setDeleting] = useState<ModelSpec | null>(null);
+  const [importing, setImporting] = useState(false);
+  // Warnings from an import ride along with the draft into the editor.
+  const [draftNotes, setDraftNotes] = useState<string[]>([]);
   const toast = useToast();
   const canWrite = me?.role === "admin" || me?.role === "deployer";
 
+  const flags = parseFlags(flagsText);
+
+  function openEditor(spec: (typeof BLANK & { id?: string }) | null, warnings: string[] = []) {
+    setEditing(spec);
+    setFlagsText(spec ? JSON.stringify(spec.extra_args ?? {}) : "{}");
+    setDraftNotes(warnings);
+  }
+
   async function save() {
-    if (!editing) return;
+    if (!editing || flags.error) return;
     try {
-      const { id, ...body } = editing;
+      const { id, ...rest } = editing;
+      const body = { ...rest, extra_args: flags.value };
       if (id) await api.put(`/api/catalog/${id}`, body);
       else await api.post("/api/catalog", body);
       toast(id ? "Catalog entry updated" : "Catalog entry added");
-      setEditing(null);
+      openEditor(null);
       refresh();
     } catch (e) {
       toast(e instanceof ApiError ? e.message : String(e), true);
@@ -49,9 +66,14 @@ export function Catalog({ me }: { me: Me | null }) {
           Per-GPU memory is what dgxctl uses to decide where a model fits. Tune it once against your own hardware.
         </p>
         {canWrite && (
-          <button className="btn primary right" onClick={() => setEditing({ ...BLANK })}>
-            + Add model
-          </button>
+          <div className="flex right" style={{ gap: 8 }}>
+            <button className="btn" onClick={() => setImporting(true)} title="Read a Hugging Face or GitHub page and fill this form in">
+              Import from URL
+            </button>
+            <button className="btn primary" onClick={() => openEditor({ ...BLANK })}>
+              + Add model
+            </button>
+          </div>
         )}
       </div>
 
@@ -92,7 +114,7 @@ export function Catalog({ me }: { me: Me | null }) {
                 <td>
                   {canWrite && (
                     <div className="flex">
-                      <button className="btn sm ghost" onClick={() => setEditing({ ...s })}>
+                      <button className="btn sm ghost" onClick={() => openEditor({ ...s })}>
                         Edit
                       </button>
                       <button className="btn sm ghost" onClick={() => setDeleting(s)}>
@@ -107,22 +129,41 @@ export function Catalog({ me }: { me: Me | null }) {
         </table>
       </section>
 
+      {importing && (
+        <ImportDialog
+          onClose={() => setImporting(false)}
+          onDrafted={(draft) => {
+            setImporting(false);
+            const { source_url, sizing_source, warnings, ...spec } = draft;
+            void source_url;
+            void sizing_source;
+            openEditor({ ...BLANK, ...spec }, warnings);
+          }}
+        />
+      )}
+
       {editing && (
         <Modal
           title={editing.id ? `Edit ${editing.display_name}` : "Add a model to the catalog"}
           width={720}
-          onClose={() => setEditing(null)}
+          onClose={() => openEditor(null)}
           footer={
             <>
-              <button className="btn" onClick={() => setEditing(null)}>
+              <button className="btn" onClick={() => openEditor(null)}>
                 Cancel
               </button>
-              <button className="btn primary" disabled={!editing.key || !editing.hf_repo} onClick={save}>
+              <button className="btn primary" disabled={!editing.key || !editing.hf_repo || !!flags.error} onClick={save}>
                 Save
               </button>
             </>
           }
         >
+          {draftNotes.map((w) => (
+            <div key={w} className="finding warning">
+              <div className="t">Check this before saving</div>
+              <div className="d">{w}</div>
+            </div>
+          ))}
           <div className="row">
             <label className="f">
               <span>Key (short handle, used as the served model name)</span>
@@ -221,16 +262,23 @@ export function Catalog({ me }: { me: Me | null }) {
             <span>Extra vLLM flags (JSON)</span>
             <textarea
               rows={2}
-              value={JSON.stringify(editing.extra_args)}
-              onChange={(e) => {
-                try {
-                  setEditing({ ...editing, extra_args: JSON.parse(e.target.value || "{}") });
-                } catch {
-                  /* keep typing */
-                }
-              }}
+              className={flags.error ? "bad" : undefined}
+              value={flagsText}
+              placeholder='{"--enable-prefix-caching": true}'
+              onChange={(e) => setFlagsText(e.target.value)}
             />
           </label>
+          {flags.error && (
+            <div className="finding error">
+              <div className="t">These flags aren't valid JSON</div>
+              <div className="d mono">{flags.error}</div>
+              <div className="fix">
+                <b>Fix →</b> flags go in a JSON object, each name quoted:{" "}
+                <code>{'{"--max-num-seqs": 128}'}</code>. Saving is off until this parses,
+                so a typo can't silently empty the entry.
+              </div>
+            </div>
+          )}
           <label className="f">
             <span>Notes shown at deploy time</span>
             <textarea rows={2} value={editing.notes} onChange={(e) => setEditing({ ...editing, notes: e.target.value })} />

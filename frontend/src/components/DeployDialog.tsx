@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "../lib/api";
+import { parseFlags } from "../lib/flags";
 import type { Deployment, ModelSpec, Plan } from "../types";
 import { Modal, useToast } from "./ui";
 
@@ -45,15 +46,12 @@ export function DeployDialog({
   const spec = useMemo(() => specs.find((s) => s.key === specKey), [specs, specKey]);
   const usingCustom = specKey === "__custom__";
 
+  /** Parse the extra-flags box, keeping the failure rather than swallowing it.
+   *  Silently falling back to `{}` on a typo is the worst outcome available: the
+   *  deploy succeeds, every flag is dropped, and nothing says so. */
+  const parsedExtra = useMemo(() => parseFlags(extra), [extra]);
+
   const body = useMemo(() => {
-    let parsedExtra: Record<string, unknown> = {};
-    if (extra.trim()) {
-      try {
-        parsedExtra = JSON.parse(extra);
-      } catch {
-        parsedExtra = {};
-      }
-    }
     return {
       spec_key: usingCustom ? null : specKey || null,
       hf_repo: usingCustom ? customRepo.trim() || null : null,
@@ -61,17 +59,19 @@ export function DeployDialog({
       tensor_parallel_size: tp === "" ? null : Number(tp),
       max_model_len: maxLen === "" ? 0 : Number(maxLen),
       gpu_memory_utilization: gpuUtil,
-      extra_args: parsedExtra,
+      extra_args: parsedExtra.value,
       image: image.trim(),
       replicas,
       node_ids: mode === "scoped" ? scope.map((t) => t.node_id) : [],
       targets: [],
     };
-  }, [usingCustom, specKey, customRepo, servedName, tp, maxLen, gpuUtil, extra, image, mode, replicas, scope]);
+  }, [usingCustom, specKey, customRepo, servedName, tp, maxLen, gpuUtil, parsedExtra, image, mode, replicas, scope]);
 
   // Re-plan on every change, debounced. Free, and it means nobody deploys blind.
   useEffect(() => {
-    if (!specKey || (usingCustom && !customRepo.trim())) {
+    // Don't plan around flags we couldn't read: a preview built from `{}` would
+    // describe settings that are not the ones on screen.
+    if (!specKey || (usingCustom && !customRepo.trim()) || parsedExtra.error) {
       setPlan(null);
       return;
     }
@@ -91,11 +91,12 @@ export function DeployDialog({
       cancelled = true;
       window.clearTimeout(t);
     };
-  }, [body, specKey, usingCustom, customRepo]);
+  }, [body, specKey, usingCustom, customRepo, parsedExtra.error]);
 
   const canDeploy =
     !busy &&
     !!(usingCustom ? customRepo.trim() : specKey) &&
+    !parsedExtra.error &&
     (plan?.placements.length ?? 0) > 0 &&
     !plan?.blocked;
 
@@ -135,7 +136,13 @@ export function DeployDialog({
           <button
             className="btn primary"
             disabled={!canDeploy}
-            title={plan?.blocked ? "These settings cannot work — see above" : undefined}
+            title={
+              parsedExtra.error
+                ? "The extra vLLM flags aren't valid JSON — see below"
+                : plan?.blocked
+                  ? "These settings cannot work — see above"
+                  : undefined
+            }
             onClick={deploy}
           >
             {busy ? "Starting…" : "Deploy"}
@@ -253,6 +260,26 @@ export function DeployDialog({
           <div className="fix"><b>Fix →</b> {c.fix}</div>
         </div>
       ))}
+
+      {/* Ways to make it fit, offered while the settings are still editable —
+          not after a rejection, which is too late to be useful. */}
+      {!!plan?.options?.length && (
+        <section className="card mb">
+          <header>
+            <h3>Ways to make this fit</h3>
+            <span className="hint right">each one fits the roomiest free GPU</span>
+          </header>
+          <div className="body">
+            {plan.options.map((o) => (
+              <div key={o.change} className="flex mt" style={{ gap: 12, alignItems: "baseline" }}>
+                <strong style={{ minWidth: 200 }}>{o.change}</strong>
+                <span className="hint">{o.detail}</span>
+                <span className="num sub right">{o.needs_gb_per_gpu} GB per GPU</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       {/* ---------------------------------------------------- plan preview */}
       <section className="card mb">
@@ -372,11 +399,24 @@ export function DeployDialog({
             <span>Extra vLLM flags (JSON)</span>
             <textarea
               rows={2}
+              className={parsedExtra.error ? "bad" : undefined}
               value={extra}
               placeholder='{"--enable-prefix-caching": true, "--max-num-seqs": 128}'
               onChange={(e) => setExtra(e.target.value)}
             />
           </label>
+          {parsedExtra.error && (
+            <div className="finding error">
+              <div className="t">These flags aren't valid JSON</div>
+              <div className="d mono">{parsedExtra.error}</div>
+              <div className="fix">
+                <b>Fix →</b> flags go in a JSON object, each name quoted:{" "}
+                <code>{'{"--max-num-seqs": 128}'}</code>. Watch for a trailing comma or a
+                single quote. Until this parses, nothing is planned and Deploy stays off —
+                flags that can't be read must not be silently dropped.
+              </div>
+            </div>
+          )}
         </>
       )}
 

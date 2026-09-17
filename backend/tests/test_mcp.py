@@ -128,7 +128,7 @@ async def test_the_server_tells_an_agent_how_to_work(agent):
 
 async def test_every_tool_is_described_and_typed(agent):
     tools = await agent.tools()
-    assert len(tools) == 21
+    assert len(tools) == 23
     for t in tools:
         assert t["description"] and len(t["description"]) > 40, f"{t['name']} is underdescribed"
         assert t["inputSchema"]["type"] == "object"
@@ -425,3 +425,55 @@ async def test_the_endpoint_is_mounted_on_the_main_app():
 
     mounts = [r for r in app.router.routes if isinstance(r, Mount) and r.path == "/mcp"]
     assert mounts, "MCP must be mounted before the SPA catch-all"
+
+
+async def test_an_agent_drafts_a_catalog_entry_without_saving_it(agent, client, monkeypatch):
+    """The agent gets the same deal a person does: a draft to show the operator,
+    and a separate, deliberate call to keep it."""
+    from app.services import catalog_import, llm, sizing
+    from tests.test_catalog_import import CARD, CONFIG, GOOD_REPLY
+
+    sizing._CONFIG_CACHE.clear()
+
+    async def card(url, headers=None):
+        return CARD if url.endswith("README.md") else ""
+
+    async def config(repo, revision="main", token=""):
+        return CONFIG
+
+    async def reply(cfg, *, system, user, **kw):
+        return llm.Completion(text=GOOD_REPLY, model="gpt-oss")
+
+    monkeypatch.setattr(catalog_import, "_get_text", card)
+    monkeypatch.setattr(sizing, "fetch_config", config)
+    monkeypatch.setattr(catalog_import, "complete", reply)
+    await client.put("/api/settings/llm", json={
+        "enabled": True, "base_url": "", "model": "gpt-oss", "api_key": "",
+        "timeout_s": 60, "max_input_chars": 24000})
+
+    before = len((await client.get("/api/catalog")).json())
+    draft = await agent.call(
+        "draft_catalog_entry",
+        url="https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct",
+    )
+    assert draft["saved"] is False
+    assert draft["display_name"] == "Llama 3.1 8B Instruct"
+    assert draft["min_gpu_memory_gb"] > 0
+    assert len((await client.get("/api/catalog")).json()) == before
+
+    saved = await agent.call(
+        "add_catalog_entry",
+        key=draft["key"], display_name=draft["display_name"],
+        hf_repo=draft["hf_repo"], min_gpu_memory_gb=draft["min_gpu_memory_gb"],
+        recommended_tp=draft["recommended_tp"],
+    )
+    assert saved["saved"] is True
+    assert len((await client.get("/api/catalog")).json()) == before + 1
+
+
+async def test_a_draft_from_an_unconfigured_portal_tells_the_agent_why(agent, client):
+    """An agent that cannot import should be told where a human would fix it,
+    not handed a bare failure."""
+    msg = await agent.call_expecting_error(
+        "draft_catalog_entry", url="https://huggingface.co/org/model")
+    assert "Settings" in msg

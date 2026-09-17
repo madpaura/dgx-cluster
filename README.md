@@ -56,6 +56,18 @@ the problem and what to change.
 twice and the two replicas become one load-balanced model group; nothing else
 to configure.
 
+**Catalog** — paste a Hugging Face or GitHub URL and the entry fills itself in.
+The model card is read, an entry is drafted, and you get the normal form to
+check and correct before anything is saved. Configure which model does the
+drafting under **Settings**; by default it is the fleet's own LiteLLM proxy, so
+nothing leaves the building and there is no external account to set up.
+
+Two limits are deliberate. Only `huggingface.co` and `github.com` can be
+fetched — the control server can reach machines a browser cannot, and an
+endpoint that fetches any URL you hand it is an SSRF hole aimed at your own
+network. And the LLM never sets the VRAM figure: that stays measured from the
+model's `config.json`, because it is what refuses a deploy that would OOM a box.
+
 ## Letting an agent run it
 
 The dashboard exposes its own capabilities as an MCP server at `/mcp`
@@ -106,6 +118,7 @@ curl -s http://localhost:8080/mcp/ \
 | | |
 |---|---|
 | **Look** | `fleet_summary` · `list_nodes` · `list_models` · `get_deployment` · `list_clusters` · `list_catalog` · `list_events` · `litellm_status` |
+| **Catalog** | `draft_catalog_entry` · `add_catalog_entry` |
 | **Diagnose** | `deployment_logs` · `diagnose_node` · `reconcile_node` |
 | **Serve** | `plan_deployment` · `deploy_model` · `stop_deployment` · `restart_deployment` |
 | **Fleet** | `register_node` · `probe_node` · `drain_node` · `create_cluster` · `move_nodes` · `resync_litellm` |
@@ -121,6 +134,10 @@ What makes them useful to an agent rather than just callable:
   parse a vLLM traceback.
 - **`fleet_summary` leads with `needs_attention`** — a list of what is wrong, or
   empty.
+- **`draft_catalog_entry` returns a draft and saves nothing**, with
+  `"saved": false` and the next step spelled out. Keeping it is a separate
+  `add_catalog_entry` call, so a model card full of instructions cannot write
+  itself into your catalog.
 - **Agent actions are attributable.** They run as `agent@mcp`, so the audit log
   distinguishes what an agent did from what a person did.
 

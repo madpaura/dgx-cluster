@@ -122,6 +122,14 @@ async def _requirement(db: AsyncSession, body: DeployRequest, spec, hf_repo: str
     return max(catalog_gb, floor), assessment
 
 
+def _int_or(value, fallback: int) -> int:
+    """A flag value we have not validated yet, read without trusting it."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
 async def _assess(db: AsyncSession, body: DeployRequest, spec, hf_repo: str, tp: int,
                   max_len: int, nodes, placements) -> sizing.Assessment:
     """Size the model and check the settings against what it declares.
@@ -142,7 +150,10 @@ async def _assess(db: AsyncSession, body: DeployRequest, spec, hf_repo: str, tp:
         hf_repo=hf_repo,
         tensor_parallel=tp,
         max_model_len=max_len,
-        max_num_seqs=int(extra.get("--max-num-seqs", extra.get("max-num-seqs", 256))),
+        # Sizing runs before the flags are judged, so it has to survive a value
+        # that is about to be rejected: vllm_args reports "--max-num-seqs expects
+        # a whole number" far more usefully than a 500 from int("lots").
+        max_num_seqs=_int_or(extra.get("--max-num-seqs", extra.get("max-num-seqs", 256)), 256),
         quantization=body.quantization or (spec.quantization if spec else ""),
         revision=spec.revision if spec else "",
         catalog_gb=(spec.min_gpu_memory_gb if spec else 0.0),
@@ -255,12 +266,14 @@ async def create_deployment(
     candidates = list(rows.scalars().unique())
     if body.node_ids:
         candidates = [n for n in candidates if n.id in set(body.node_ids)]
-    per_gpu_gb, assessment = await _requirement(db, body, spec, hf_repo, tp, max_len, candidates)
-
+    # Flags first: it is a dictionary lookup, it needs no network, and a bad one
+    # makes everything after it meaningless.
     bad_args = [i for i in vllm_args.validate({**(spec.extra_args if spec else {}), **body.extra_args})
                 if i.severity == "error"]
     if bad_args:
         raise HTTPException(422, f"{bad_args[0].title}: {bad_args[0].detail} {bad_args[0].fix}")
+
+    per_gpu_gb, assessment = await _requirement(db, body, spec, hf_repo, tp, max_len, candidates)
     if assessment.blocking:
         first = assessment.blocking[0]
         raise HTTPException(422, f"{first.title}: {first.detail} {first.fix}")

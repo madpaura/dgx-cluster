@@ -9,6 +9,7 @@ import { Catalog } from "./pages/Catalog";
 import { Fleet } from "./pages/Fleet";
 import { Models } from "./pages/Models";
 import { Proxy } from "./pages/Proxy";
+import { Settings } from "./pages/Settings";
 
 /** The always-visible strip. Six numbers that answer "is the cluster fine?"
  *  without clicking anything. */
@@ -126,6 +127,9 @@ export default function App() {
           <NavLink to="/activity" className={({ isActive }) => (isActive ? "active" : "")}>
             Activity
           </NavLink>
+          <NavLink to="/settings" className={({ isActive }) => (isActive ? "active" : "")}>
+            Settings
+          </NavLink>
         </nav>
         <div className="spacer" />
         <ThemeSwitcher />
@@ -155,6 +159,7 @@ export default function App() {
           <Route path="/proxy" element={<Proxy me={me} />} />
           <Route path="/catalog" element={<Catalog me={me} />} />
           <Route path="/activity" element={<Activity />} />
+          <Route path="/settings" element={<Settings me={me} />} />
           <Route path="*" element={<Navigate to="/fleet" replace />} />
         </Routes>
       </main>

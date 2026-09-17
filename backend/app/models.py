@@ -267,3 +267,18 @@ class Event(Base):
     source_id: Mapped[str] = mapped_column(String(36), default="")
     message: Mapped[str] = mapped_column(Text, default="")
     detail: Mapped[dict] = mapped_column(JSONType, default=dict)
+
+
+class AppSetting(Base):
+    """Portal settings an operator edits in the browser, rather than a redeploy.
+
+    One row per setting group, value as JSON. Env vars stay the place for things
+    needed before the database is up (its own URL, the driver); this is for what
+    an admin should be able to change at runtime — currently the LLM used to
+    draft catalog entries.
+    """
+    __tablename__ = "app_settings"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSONType, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    updated_by: Mapped[str] = mapped_column(String(255), default="")

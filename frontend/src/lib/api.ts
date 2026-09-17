@@ -88,6 +88,13 @@ export function usePolled<T>(path: string, intervalMs = 5000, deps: unknown[] = 
   useEffect(() => {
     alive.current = true;
     refresh();
+    // A non-positive interval means fetch once — settings pages don't change
+    // under you. Passing it to setInterval would busy-loop on the endpoint.
+    if (intervalMs <= 0) {
+      return () => {
+        alive.current = false;
+      };
+    }
     const id = window.setInterval(refresh, intervalMs);
     return () => {
       alive.current = false;

@@ -2,12 +2,24 @@ import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
 from .config import settings
 
 engine = create_async_engine(settings.database_url, pool_size=10, max_overflow=20, pool_pre_ping=True)
+
+if settings.database_url.startswith("sqlite"):
+    # SQLite ignores foreign keys unless asked, and the tests run on SQLite while
+    # production runs on Postgres. Without this, deleting a row that something
+    # else references passes every test and 500s on the real database — which is
+    # exactly how the catalog-delete bug reached a running deployment.
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enforce_foreign_keys(dbapi_connection, _record):  # pragma: no cover - driver hook
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
