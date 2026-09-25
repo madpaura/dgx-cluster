@@ -4,7 +4,7 @@
 # Control plane for a GPU fleet. Runs on a management server with no GPUs of
 # its own; it reaches the DGX boxes and workstations over SSH.
 #
-# Usage: ./setup.sh [check|start|down|restart|logs|status|test|mcp|keygen|clean]
+# Usage: ./setup.sh [check|start|down|restart|logs|status|test|mcp|keygen|clean|backup|restore]
 
 set -e
 
@@ -335,6 +335,144 @@ JSON
     echo ""
 }
 
+# ── Migrate: backup / restore ────────────────────────────────────
+#
+# Moves the whole control plane to a new machine: both Postgres databases
+# (dgxctl's and LiteLLM's — keys, spend, teams, models stored in the DB), plus
+# .env, secrets/ and litellm/config.yaml. .env must travel with the dumps:
+# LITELLM_SALT_KEY decrypts the credentials LiteLLM stored, and
+# DGXCTL_SECRET_KEY signs the sessions and settings dgxctl stored.
+
+MIGRATE_DBS="dgxctl litellm"
+
+wait_postgres() {
+    compose up -d postgres >/dev/null 2>&1
+    for _ in $(seq 1 60); do
+        compose exec -T postgres pg_isready -U dgxctl >/dev/null 2>&1 && return 0
+        sleep 2
+    done
+    fail "Postgres did not become ready"
+    exit 1
+}
+
+psql_admin() {
+    compose exec -T postgres psql -v ON_ERROR_STOP=1 -U dgxctl -d postgres -qAt "$@"
+}
+
+backup() {
+    local out="${1:-dgxctl-migrate-$(date +%Y%m%d-%H%M%S).tar.gz}"
+    [ -f .env ] || { fail "No .env here — nothing to back up"; exit 1; }
+    header "Backing up to $out"
+
+    # Writers stopped so the two databases are captured at the same moment.
+    local running
+    local pg_was_up
+    pg_was_up=$(compose ps --services --status running 2>/dev/null | grep -x postgres || true)
+    running=$(compose ps --services --status running 2>/dev/null | grep -E '^(api|litellm)$' || true)
+    [ -n "$running" ] && { compose stop $running >/dev/null; ok "Paused: $(echo $running)"; }
+    wait_postgres
+
+    local stage
+    stage=$(mktemp -d)
+    mkdir -p "$stage/db"
+    for db in $MIGRATE_DBS; do
+        if [ "$(psql_admin -c "SELECT 1 FROM pg_database WHERE datname='$db'")" != "1" ]; then
+            warn "Database '$db' does not exist — skipped"
+            continue
+        fi
+        compose exec -T postgres pg_dump -U dgxctl -Fc "$db" > "$stage/db/$db.dump"
+        ok "Dumped $db ($(du -h "$stage/db/$db.dump" | cut -f1))"
+    done
+
+    cp .env "$stage/.env"
+    cp -r secrets "$stage/secrets"
+    mkdir -p "$stage/litellm" && cp litellm/config.yaml "$stage/litellm/config.yaml"
+    {
+        echo "created=$(date -Is)"
+        echo "host=$(hostname)"
+        echo "git=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+        echo "postgres=$(compose exec -T postgres postgres --version | awk '{print $NF}')"
+    } > "$stage/MANIFEST"
+    ok "Included .env, secrets/, litellm/config.yaml"
+
+    (umask 077; tar -czf "$out" -C "$stage" .)
+    rm -rf "$stage"
+    [ -z "$pg_was_up" ] && compose stop postgres >/dev/null 2>&1
+    [ -n "$running" ] && { compose start $running >/dev/null; ok "Resumed: $(echo $running)"; }
+
+    echo ""
+    echo -e "  ${GREEN}$out${NC}  ($(du -h "$out" | cut -f1)) — contains secrets, keep it private."
+    echo ""
+    echo "  On the new machine, with this repo checked out:"
+    echo "    scp $out newhost:~/dgx-cluster/"
+    echo "    ./setup.sh restore $out"
+    echo ""
+}
+
+restore() {
+    local archive="$1"
+    [ -f "$archive" ] || { fail "Usage: ./setup.sh restore <backup.tar.gz>"; exit 1; }
+    header "Restoring from $archive"
+
+    local stage
+    stage=$(mktemp -d)
+    tar -xzf "$archive" -C "$stage"
+    [ -f "$stage/.env" ] && [ -d "$stage/db" ] || { fail "Not a dgxctl backup"; exit 1; }
+    sed 's/^/      /' "$stage/MANIFEST" 2>/dev/null || true
+
+    warn "This REPLACES the databases, .env, secrets/ and litellm/config.yaml here."
+    if [ "${ASSUME_YES:-}" != "1" ]; then
+        read -r -p "  Type 'yes' to continue: " reply
+        [ "$reply" = "yes" ] || { echo "  Cancelled."; exit 0; }
+    fi
+
+    compose stop api litellm >/dev/null 2>&1 || true
+
+    # Keep what was here, in case this was the wrong machine.
+    local keep
+    keep=".pre-restore-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$keep"
+    [ -f .env ] && cp .env "$keep/"
+    [ -d secrets ] && cp -r secrets "$keep/"
+    [ -f litellm/config.yaml ] && cp litellm/config.yaml "$keep/"
+    ok "Previous config saved in $keep/"
+
+    cp "$stage/.env" .env
+    rm -rf secrets && cp -r "$stage/secrets" secrets
+    chmod 600 secrets/fleet_key 2>/dev/null || true
+    mkdir -p litellm && cp "$stage/litellm/config.yaml" litellm/config.yaml
+    ok "Restored .env, secrets/, litellm/config.yaml"
+
+    wait_postgres
+    # An existing volume keeps the password it was created with; align it with
+    # the restored .env (the socket inside the container needs no password).
+    psql_admin -c "ALTER USER dgxctl PASSWORD '$(env_value POSTGRES_PASSWORD)'" >/dev/null
+
+    local dump db
+    for dump in "$stage"/db/*.dump; do
+        db=$(basename "$dump" .dump)
+        psql_admin -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" >/dev/null
+        psql_admin -c "CREATE DATABASE \"$db\" OWNER dgxctl" >/dev/null
+        compose exec -T postgres pg_restore -U dgxctl -d "$db" --no-owner --exit-on-error < "$dump"
+        ok "Restored $db"
+    done
+    rm -rf "$stage"
+
+    start
+    show_row_counts
+}
+
+show_row_counts() {
+    header "Restored data"
+    local db
+    for db in $MIGRATE_DBS; do
+        compose exec -T postgres psql -U dgxctl -d "$db" -qAt -c "ANALYZE" >/dev/null 2>&1 || continue
+        compose exec -T postgres psql -U dgxctl -d "$db" -qAt -c \
+            "SELECT relname || ': ' || n_live_tup FROM pg_stat_user_tables WHERE n_live_tup > 0 ORDER BY relname" 2>/dev/null \
+            | sed "s/^/  $db./" || true
+    done
+}
+
 # ── Main ─────────────────────────────────────────────────────────
 
 case "${1:-check}" in
@@ -348,6 +486,8 @@ case "${1:-check}" in
     mcp)              mcp_details ;;
     keygen)           keygen ;;
     clean)            clean ;;
+    backup)           backup "$2" ;;
+    restore)          restore "$2" ;;
     *)
         echo "dgxctl — GPU fleet control plane"
         echo ""
@@ -363,6 +503,8 @@ case "${1:-check}" in
         echo "  mcp        Print MCP connection details for an agent"
         echo "  keygen     Generate the SSH key to install on the GPU nodes"
         echo "  clean      Stop and DELETE all data (asks first)"
+        echo "  backup     Dump both databases + .env/secrets into one archive"
+        echo "  restore    Restore that archive on a new machine: ./setup.sh restore <file>"
         echo ""
         echo "First run:  ./setup.sh check && ./setup.sh start"
         ;;

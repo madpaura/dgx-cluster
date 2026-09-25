@@ -199,6 +199,8 @@ card and be told why. No hardware is touched.
 | `./setup.sh mcp` | Print MCP connection details for an agent |
 | `./setup.sh keygen` | Generate the SSH key to install on the GPU nodes |
 | `./setup.sh clean` | Stop and delete all data (asks first) |
+| `./setup.sh backup [file]` | Dump both databases, `.env` and `secrets/` into one archive |
+| `./setup.sh restore <file>` | Restore that archive — how you move to a new machine |
 
 ### Without Docker
 

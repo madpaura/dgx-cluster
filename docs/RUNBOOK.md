@@ -65,14 +65,26 @@ run a field diagnostic, open an RMA. dgxctl will keep scheduling onto a GPU that
 merely reports errors — it does not know the card is dying, only that you have
 not drained it.
 
-## Backup
+## Backup and moving to a new machine
 
-Everything durable is in Postgres: node inventory, deployments, catalog, audit
-log, metric samples.
+Everything durable is in Postgres, in two databases: `dgxctl` (node inventory,
+deployments, catalog, audit log, metric samples) and `litellm` (virtual keys,
+teams, spend, models stored in the DB). Neither is usable without `.env`:
+`LITELLM_SALT_KEY` decrypts what LiteLLM stored.
 
 ```bash
-docker compose exec postgres pg_dump -U dgxctl dgxctl | gzip > dgxctl-$(date +%F).sql.gz
+./setup.sh backup                    # both DBs + .env + secrets/ + litellm/config.yaml
+scp dgxctl-migrate-*.tar.gz newhost:~/dgx-cluster/
+# on the new machine, in a checkout of the same commit:
+./setup.sh restore dgxctl-migrate-<stamp>.tar.gz
 ```
+
+`backup` pauses the API and LiteLLM while it dumps, so both databases are
+captured at the same moment, then resumes them. `restore` saves whatever
+config was already there into `.pre-restore-<stamp>/`, replaces both databases,
+and starts the stack. The archive holds the fleet SSH key and every secret —
+treat it like one. Stop the old machine before starting the new one, or both
+will manage the same nodes.
 
 The vLLM containers themselves are disposable — dgxctl can recreate any
 deployment from its recorded arguments.
